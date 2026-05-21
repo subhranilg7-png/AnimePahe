@@ -84,13 +84,11 @@ def _migrate_bot_settings(collection):
     except Exception as e:
         logger.error(f"[Migration] bot_settings migration failed: {e}")
 
-
 def _validate_bot_setting(setting_name, setting_value):
     if setting_name is None or (isinstance(setting_name, str) and not setting_name.strip()):
         raise ValueError(f"setting_name must be a non-empty string, got: {setting_name!r}")
     if not isinstance(setting_name, str):
         raise ValueError(f"setting_name must be a string, got type: {type(setting_name).__name__}")
-
 
 def save_bot_setting(setting_name: str, setting_value) -> bool:
     try:
@@ -110,7 +108,6 @@ def save_bot_setting(setting_name: str, setting_value) -> bool:
         logger.error(f"Error saving bot setting '{setting_name}': {e}")
         return False
 
-
 def load_bot_setting(setting_name: str, default=None):
     try:
         if bot_settings_collection is not None:
@@ -125,7 +122,6 @@ def load_bot_setting(setting_name: str, default=None):
     except Exception as e:
         logger.error(f"Error loading bot setting '{setting_name}': {e}")
         return default
-
 
 if MONGO_URI:
     try:
@@ -215,11 +211,9 @@ def load_json_data():
     except (FileNotFoundError, json.JSONDecodeError):
         return {"processed_episodes": [], "posted_banners": [], "anime_hashtags": [], "admins": [], "bot_settings": {}, "anime_channels": []}
 
-
 def save_json_data(data):
     with open(JSON_DATA_FILE, 'w') as f:
         json.dump(data, f, indent=2)
-
 
 async def add_anime_channel(anime_title: str, channel_id: int, channel_username: str = None) -> bool:
     try:
@@ -252,7 +246,6 @@ async def add_anime_channel(anime_title: str, channel_id: int, channel_username:
         logger.error(f"Error adding anime channel: {e}")
         return False
 
-
 async def remove_anime_channel(anime_title: str) -> bool:
     try:
         if anime_channels_collection is not None:
@@ -272,7 +265,6 @@ async def remove_anime_channel(anime_title: str) -> bool:
         logger.error(f"Error removing anime channel: {e}")
         return False
 
-
 async def get_anime_channel(anime_title: str) -> dict:
     try:
         if anime_channels_collection is not None:
@@ -286,7 +278,6 @@ async def get_anime_channel(anime_title: str) -> dict:
         logger.error(f"Error getting anime channel: {e}")
         return None
 
-
 async def get_all_anime_channels() -> list:
     try:
         if anime_channels_collection is not None:
@@ -298,7 +289,6 @@ async def get_all_anime_channels() -> list:
     except Exception as e:
         logger.error(f"Error getting all anime channels: {e}")
         return []
-
 
 async def add_request(user_id: int, text: str, username: str = None) -> bool:
     try:
@@ -324,7 +314,6 @@ async def add_request(user_id: int, text: str, username: str = None) -> bool:
     except Exception as e:
         logger.error(f"Error adding request: {e}")
         return False
-
 
 async def add_processed_request_result(request_text: str, anime_title: str) -> bool:
     try:
@@ -360,7 +349,6 @@ async def add_processed_request_result(request_text: str, anime_title: str) -> b
         logger.error(f"Error adding processed request result: {e}")
         return False
 
-
 async def get_processed_request_results(request_text: str) -> list:
     try:
         if processed_requests_collection is not None:
@@ -374,7 +362,6 @@ async def get_processed_request_results(request_text: str) -> list:
     except Exception as e:
         logger.error(f"Error getting processed request results: {e}")
         return []
-
 
 async def clear_processed_request(request_text: str) -> bool:
     try:
@@ -395,7 +382,6 @@ async def clear_processed_request(request_text: str) -> bool:
         logger.error(f"Error clearing processed request: {e}")
         return False
 
-
 async def get_user_pending_requests(user_id: int) -> int:
     try:
         if requests_collection is not None:
@@ -409,7 +395,6 @@ async def get_user_pending_requests(user_id: int) -> int:
         logger.error(f"Error getting user pending requests: {e}")
         return 0
 
-
 async def get_all_pending_requests() -> list:
     try:
         if requests_collection is not None:
@@ -421,7 +406,6 @@ async def get_all_pending_requests() -> list:
     except Exception as e:
         logger.error(f"Error getting all pending requests: {e}")
         return []
-
 
 async def get_pending_request_count() -> int:
     try:
@@ -435,7 +419,6 @@ async def get_pending_request_count() -> int:
     except Exception as e:
         logger.error(f"Error getting pending request count: {e}")
         return 0
-
 
 def mark_request_processed(request_id) -> bool:
     try:
@@ -460,7 +443,6 @@ def mark_request_processed(request_id) -> bool:
         logger.error(f"Error marking request processed: {e}")
         return False
 
-
 async def delete_request(request_id) -> bool:
     try:
         if requests_collection is not None:
@@ -480,7 +462,6 @@ async def delete_request(request_id) -> bool:
         logger.error(f"Error deleting request: {e}")
         return False
 
-
 async def get_max_requests_setting() -> int:
     try:
         if bot_settings_collection is not None:
@@ -491,7 +472,6 @@ async def get_max_requests_setting() -> int:
     except Exception as e:
         logger.error(f"Error getting max requests setting: {e}")
         return 5
-
 
 async def set_max_requests_setting(value: int) -> bool:
     try:
@@ -508,7 +488,6 @@ async def set_max_requests_setting(value: int) -> bool:
         logger.error(f"Error setting max requests: {e}")
         return False
 
-
 async def get_request_process_time() -> str:
     try:
         if bot_settings_collection is not None:
@@ -519,7 +498,6 @@ async def get_request_process_time() -> str:
     except Exception as e:
         logger.error(f"Error getting request process time: {e}")
         return "00:00"
-
 
 async def set_request_process_time(time_str: str) -> bool:
     try:
@@ -536,7 +514,6 @@ async def set_request_process_time(time_str: str) -> bool:
         logger.error(f"Error setting request process time: {e}")
         return False
 
-
 async def get_request_group_chat() -> dict:
     try:
         if bot_settings_collection is not None:
@@ -547,7 +524,6 @@ async def get_request_group_chat() -> dict:
     except Exception as e:
         logger.error(f"Error getting request group chat: {e}")
         return {}
-
 
 async def set_request_group_chat(chat_id: int = None, username: str = None) -> bool:
     try:
@@ -569,3 +545,4 @@ async def set_request_group_chat(chat_id: int = None, username: str = None) -> b
     except Exception as e:
         logger.error(f"Error setting request group chat: {e}")
         return False
+

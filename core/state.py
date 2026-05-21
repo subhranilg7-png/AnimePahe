@@ -19,16 +19,14 @@ from core.database import (
 
 logger = logging.getLogger(__name__)
 
-
-
 class EpisodeState(Enum):
     PENDING = "pending"
     PROCESSING = "processing"
     COMPLETED = "completed"
     POSTED = "posted"
 
-
 class EpisodeTracker:
+    
     def __init__(self):
         self._lock = threading.RLock()
         self._async_lock = None
@@ -42,7 +40,6 @@ class EpisodeTracker:
             try:
                 self._async_lock = asyncio.Lock()
             except RuntimeError:
-                # No event loop running yet
                 pass
         return self._async_lock
     
@@ -123,7 +120,7 @@ class EpisodeTracker:
             if current_state is not None and current_state != EpisodeState.PENDING:
                 logger.info(f"Episode {ep_id} cannot start processing: current state is {current_state.value}")
                 return False
-
+            
             self.episodes[ep_id] = {
                 'anime_title': anime_title,
                 'episode_number': episode_number,
@@ -224,9 +221,7 @@ class EpisodeTracker:
                 self._save_tracker()
                 logger.info(f"Cleaned up {len(to_remove)} old episode entries")
 
-
 episode_tracker = EpisodeTracker()
-
 
 class AnimeQueue:
     
@@ -302,7 +297,6 @@ class AnimeQueue:
                 if datetime.fromisoformat(item['added_time']) > cutoff_date
             ]
             self.save_queue()
-
 
 class QualitySettings:
     
@@ -393,7 +387,6 @@ class QualitySettings:
         self.state["batch_mode"] = bool(value)
         self.save_state()
 
-
 class BotSettings:
     
     def __init__(self) -> None:
@@ -459,7 +452,6 @@ class BotSettings:
     def set(self, key: str, value: Any) -> None:
         self.state[key] = value
         self.save_state()
-
 
 class AutoDownloadState:
     
@@ -564,7 +556,6 @@ class AutoDownloadState:
         self.state["last_checked"] = timestamp
         self.save_state()
 
-
 class UserState:
     
     def __init__(self):
@@ -585,15 +576,140 @@ class UserState:
         self.rate_limited_until = 0
         self.current_batch_page = 1
 
+class DeferredEpisodes:
+    """Tracks episodes that are waiting for all selected qualities to become available on the site."""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.deferred_file = BASE_DIR / "deferred_episodes.json"
+        self.episodes: Dict[str, Dict[str, Any]] = {}
+        self.load_deferred()
+    
+    def load_deferred(self):
+        try:
+            if self.deferred_file.exists():
+                with open(self.deferred_file, 'r') as f:
+                    data = json.load(f)
+                    self.episodes = data.get('episodes', {})
+                    logger.info(f"Loaded {len(self.episodes)} deferred episodes")
+        except Exception as e:
+            logger.error(f"Error loading deferred episodes: {e}")
+            self.episodes = {}
+    
+    def _save(self):
+        try:
+            data = {
+                'episodes': self.episodes,
+                'last_updated': datetime.now().isoformat()
+            }
+            temp_file = self.deferred_file.with_suffix('.tmp')
+            with open(temp_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            temp_file.replace(self.deferred_file)
+        except Exception as e:
+            logger.error(f"Error saving deferred episodes: {e}")
+    
+    def _get_key(self, anime_title: str, episode_number: int) -> str:
+        return f"{anime_title}_{episode_number}"
+    
+    def defer_episode(self, anime_title: str, episode_number: int, 
+                      available_qualities: List[str], missing_qualities: List[str],
+                      anime_data: Dict[str, Any] = None):
+        """Add an episode to deferred list because not all qualities are available yet."""
+        with self._lock:
+            key = self._get_key(anime_title, episode_number)
+            now = datetime.now().isoformat()
+            
+            if key in self.episodes:
+                # Update existing entry
+                self.episodes[key]['last_checked'] = now
+                self.episodes[key]['check_count'] = self.episodes[key].get('check_count', 0) + 1
+                self.episodes[key]['available_qualities'] = available_qualities
+                self.episodes[key]['missing_qualities'] = missing_qualities
+            else:
+                # New deferred entry
+                self.episodes[key] = {
+                    'anime_title': anime_title,
+                    'episode_number': episode_number,
+                    'anime_data': anime_data or {'anime_title': anime_title, 'episode': episode_number},
+                    'available_qualities': available_qualities,
+                    'missing_qualities': missing_qualities,
+                    'deferred_at': now,
+                    'last_checked': now,
+                    'check_count': 1
+                }
+            
+            self._save()
+            logger.info(f"Deferred {anime_title} Ep{episode_number}: missing {missing_qualities}, available {available_qualities}, checks: {self.episodes[key]['check_count']}")
+    
+    def remove_episode(self, anime_title: str, episode_number: int):
+        """Remove an episode from deferred list (it got processed or expired)."""
+        with self._lock:
+            key = self._get_key(anime_title, episode_number)
+            if key in self.episodes:
+                del self.episodes[key]
+                self._save()
+                logger.info(f"Removed {anime_title} Ep{episode_number} from deferred list")
+    
+    def get_all_deferred(self) -> List[Dict[str, Any]]:
+        """Get all deferred episodes for retry checking."""
+        with self._lock:
+            return list(self.episodes.values())
+    
+    def is_deferred(self, anime_title: str, episode_number: int) -> bool:
+        """Check if an episode is currently deferred."""
+        key = self._get_key(anime_title, episode_number)
+        return key in self.episodes
+    
+    def get_check_count(self, anime_title: str, episode_number: int) -> int:
+        """Get how many times this episode has been checked."""
+        key = self._get_key(anime_title, episode_number)
+        if key in self.episodes:
+            return self.episodes[key].get('check_count', 0)
+        return 0
+    
+    def cleanup_expired(self, max_checks: int = 48, max_hours: int = 72):
+        """Remove deferred episodes that have been checked too many times or are too old."""
+        with self._lock:
+            to_remove = []
+            now = datetime.now()
+            
+            for key, data in self.episodes.items():
+                # Remove if checked too many times
+                if data.get('check_count', 0) >= max_checks:
+                    to_remove.append(key)
+                    logger.warning(f"Deferred episode expired (max checks): {data['anime_title']} Ep{data['episode_number']}")
+                    continue
+                
+                # Remove if too old
+                try:
+                    deferred_at = datetime.fromisoformat(data['deferred_at'])
+                    hours_elapsed = (now - deferred_at).total_seconds() / 3600
+                    if hours_elapsed >= max_hours:
+                        to_remove.append(key)
+                        logger.warning(f"Deferred episode expired (too old - {hours_elapsed:.1f}h): {data['anime_title']} Ep{data['episode_number']}")
+                except Exception:
+                    pass
+            
+            for key in to_remove:
+                del self.episodes[key]
+            
+            if to_remove:
+                self._save()
+                logger.info(f"Cleaned up {len(to_remove)} expired deferred episodes")
+
 
 anime_queue = AnimeQueue()
 quality_settings = QualitySettings()
 bot_settings = BotSettings()
 auto_download_state = AutoDownloadState()
+deferred_episodes = DeferredEpisodes()
 user_states = {}
 
 __all__ = [
     'AnimeQueue', 'QualitySettings', 'BotSettings', 'AutoDownloadState', 'UserState',
     'anime_queue', 'quality_settings', 'bot_settings', 'auto_download_state', 'user_states',
-    'EpisodeState', 'EpisodeTracker', 'episode_tracker'
+    'EpisodeState', 'EpisodeTracker', 'episode_tracker',
+    'DeferredEpisodes', 'deferred_episodes'
 ]
+

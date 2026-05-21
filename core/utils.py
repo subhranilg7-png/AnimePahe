@@ -27,17 +27,14 @@ from core.database import (
 
 logger = logging.getLogger(__name__)
 
-
 def sanitize_filename(file_name: str) -> str:
     sanitized = re.sub(r'[<>:"/\\|?*]', '', file_name)
     return sanitized.strip()
-
 
 def create_short_name(name: str, max_length: int = 30) -> str:
     if len(name) > max_length:
         return ''.join(word[0].upper() for word in name.split())
     return name
-
 
 def format_size(size_bytes: int) -> str:
     if not isinstance(size_bytes, (int, float)):
@@ -55,7 +52,6 @@ def format_size(size_bytes: int) -> str:
     else:
         return f"{size_bytes/(1024**3):.2f} GB"
 
-
 def format_speed(speed_bytes):
     if not isinstance(speed_bytes, (int, float)):
         return "0 B/s"
@@ -69,7 +65,6 @@ def format_speed(speed_bytes):
     else:
         return f"{speed_bytes/(1024**3):.2f} GB/s"
 
-
 def format_time(seconds):
     seconds = int(seconds)
     minutes, seconds = divmod(seconds, 60)
@@ -81,7 +76,6 @@ def format_time(seconds):
         return f"{minutes}m {seconds}s"
     else:
         return f"{seconds}s"
-
 
 def format_filename(anime_title, episode_number, quality, type_str):
     season_match = re.search(r'Season (\d+)', anime_title, re.IGNORECASE)
@@ -98,7 +92,6 @@ def format_filename(anime_title, episode_number, quality, type_str):
     
     return f"[{season}-{ep_num}] {clean_title} [{quality}] [{type_str}]"
 
-
 async def resolve_channel_entity(client, channel_id_or_username):
     entity = await client.get_entity(channel_id_or_username)
 
@@ -106,7 +99,6 @@ async def resolve_channel_entity(client, channel_id_or_username):
         raise ValueError("Target is not a channel")
 
     return await client.get_input_entity(PeerChannel(entity.id))
-
 
 def download_start_pic(url: str, save_path=THUMBNAIL_DIR / "start_pic.jpg"):
     try:
@@ -120,13 +112,11 @@ def download_start_pic(url: str, save_path=THUMBNAIL_DIR / "start_pic.jpg"):
         print(f"[ERROR] Failed to download start pic: {e}")
         return None
 
-
 def download_start_pic_if_not_exists(url: str, save_path=THUMBNAIL_DIR / "start_pic.jpg"):
     if save_path.exists():
         print(f"[INFO] Start pic already exists at '{save_path}'")
         return str(save_path)
     return download_start_pic(url, save_path)
-
 
 async def get_fixed_thumbnail():
     thumbnail_path = os.path.join(THUMBNAIL_DIR, "fixed_thumbnail.png")
@@ -143,8 +133,6 @@ async def get_fixed_thumbnail():
             logger.error(f"Error downloading fixed thumbnail: {e}")
     
     return thumbnail_path if os.path.exists(thumbnail_path) else None
-
-
 
 def is_admin(user_id: int) -> bool:
     if user_id == ADMIN_CHAT_ID:
@@ -163,7 +151,6 @@ def is_admin(user_id: int) -> bool:
             if admin["user_id"] == user_id:
                 return True
         return False
-
 
 def add_admin(user_id: int, username: str = None) -> bool:
     if admins_collection is not None:
@@ -196,7 +183,6 @@ def add_admin(user_id: int, username: str = None) -> bool:
         save_json_data(data)
         return True
 
-
 def remove_admin(user_id: int) -> bool:
     if admins_collection is not None:
         try:
@@ -217,8 +203,6 @@ def remove_admin(user_id: int) -> bool:
         
         return False
 
-
-
 def is_episode_processed(anime_title: str, episode_number: int) -> bool:
     from core.state import quality_settings
     
@@ -231,7 +215,19 @@ def is_episode_processed(anime_title: str, episode_number: int) -> bool:
             if result:
                 processed_qualities = set(result.get("qualities", []))
                 enabled_qualities = set(quality_settings.enabled_qualities)
-                return processed_qualities.issuperset(enabled_qualities)
+                
+                # If no qualities recorded but entry exists, treat as not fully processed
+                if not processed_qualities:
+                    logger.warning(f"Episode {anime_title} Ep{episode_number} exists in DB but has no qualities recorded")
+                    return False
+                
+                is_complete = processed_qualities.issuperset(enabled_qualities)
+                if is_complete:
+                    logger.debug(f"Episode {anime_title} Ep{episode_number} fully processed: {processed_qualities}")
+                else:
+                    logger.info(f"Episode {anime_title} Ep{episode_number} partially processed: have {processed_qualities}, need {enabled_qualities}")
+                return is_complete
+            return False
         except Exception as e:
             logger.error(f"Error checking processed episode: {e}")
             return False
@@ -241,9 +237,10 @@ def is_episode_processed(anime_title: str, episode_number: int) -> bool:
             if ep["anime_title"] == anime_title and ep["episode_number"] == episode_number:
                 processed_qualities = set(ep.get("qualities", []))
                 enabled_qualities = set(quality_settings.enabled_qualities)
+                if not processed_qualities:
+                    return False
                 return processed_qualities.issuperset(enabled_qualities)
     return False
-
 
 def update_processed_qualities(anime_title: str, episode_number: int, quality: str) -> bool:
     if processed_episodes_collection is not None:
@@ -297,8 +294,14 @@ def update_processed_qualities(anime_title: str, episode_number: int, quality: s
         save_json_data(data)
         return True
 
-
-def mark_episode_processed(anime_title: str, episode_number: int, qualities: List[str]) -> bool:
+def mark_episode_processed(anime_title: str, episode_number: int, qualities: List[str] = None) -> bool:
+    from core.state import quality_settings
+    
+    # If no qualities provided, use current enabled qualities as fallback
+    if not qualities:
+        qualities = quality_settings.enabled_qualities
+        logger.warning(f"mark_episode_processed called without qualities for {anime_title} Ep{episode_number}, using enabled: {qualities}")
+    
     if processed_episodes_collection is not None:
         try:
             processed_episodes_collection.update_one(
@@ -309,22 +312,34 @@ def mark_episode_processed(anime_title: str, episode_number: int, qualities: Lis
                 }},
                 upsert=True
             )
+            logger.info(f"Marked {anime_title} Ep{episode_number} as processed in DB with qualities: {qualities}")
             return True
         except Exception as e:
             logger.error(f"Error marking episode as processed: {e}")
             return False
     else:
         data = load_json_data()
-        data["processed_episodes"].append({
-            "anime_title": anime_title,
-            "episode_number": episode_number,
-            "qualities": qualities,
-            "processed_at": datetime.now().isoformat()
-        })
+        # Check if entry already exists
+        existing = None
+        for ep in data["processed_episodes"]:
+            if ep["anime_title"] == anime_title and ep["episode_number"] == episode_number:
+                existing = ep
+                break
+        
+        if existing:
+            # Update existing entry
+            existing["qualities"] = qualities
+            existing["processed_at"] = datetime.now().isoformat()
+        else:
+            data["processed_episodes"].append({
+                "anime_title": anime_title,
+                "episode_number": episode_number,
+                "qualities": qualities,
+                "processed_at": datetime.now().isoformat()
+            })
         save_json_data(data)
+        logger.info(f"Marked {anime_title} Ep{episode_number} as processed in JSON with qualities: {qualities}")
         return True
-
-
 
 def is_banner_posted(anime_title: str) -> bool:
     if anime_banners_collection is not None:
@@ -340,7 +355,6 @@ def is_banner_posted(anime_title: str) -> bool:
             if banner["anime_title"] == anime_title:
                 return True
         return False
-
 
 def mark_banner_posted(anime_title: str) -> bool:
     if anime_banners_collection is not None:
@@ -362,7 +376,6 @@ def mark_banner_posted(anime_title: str) -> bool:
         })
         save_json_data(data)
         return True
-
 
 def get_anime_hashtag(anime_title: str) -> str:
     if anime_hashtags_collection is not None:
@@ -494,8 +507,6 @@ def get_anime_hashtag(anime_title: str) -> str:
     
     return hashtag
 
-
-
 async def encode(string):
     string_bytes = string.encode("ascii")
     base64_bytes = base64.urlsafe_b64encode(string_bytes)
@@ -619,7 +630,6 @@ async def generate_single_link(msg_id: int) -> str:
         logger.error(f"Error generating single link: {e}")
         return None
 
-
 class ProgressMessage:
     
     def __init__(self, client, chat_id, initial_text, parse_mode='html'):
@@ -719,7 +729,6 @@ class ProgressMessage:
         except Exception as e:
             logger.error(f"Error sending new progress message: {e}")
 
-
 class UploadProgressBar:
     
     def __init__(self, client, chat_id, name):
@@ -803,8 +812,6 @@ class UploadProgressBar:
     def cancel(self):
         self.cancelled = True
 
-
-
 async def safe_edit(event, text, **kwargs):
     max_retries = 3
     retry_count = 0
@@ -829,7 +836,6 @@ async def safe_edit(event, text, **kwargs):
     logger.error(f"Max retries ({max_retries}) reached for editing message")
     return None
 
-
 async def safe_respond(event, text, **kwargs):
     kwargs.setdefault('link_preview', False)
     try:
@@ -846,7 +852,6 @@ async def safe_respond(event, text, **kwargs):
         logger.error(f"Error responding: {e}")
         return None
 
-
 async def safe_send_message(client, chat_id, text, **kwargs):
     kwargs.setdefault('link_preview', False)
     try:
@@ -862,3 +867,8 @@ async def safe_send_message(client, chat_id, text, **kwargs):
     except Exception as e:
         logger.error(f"Error sending message: {e}")
         return None
+
+
+async def download_anime_poster(title: str, save_dir: str = None):
+    from core.anime_api import download_anime_poster as _download_poster
+    return await _download_poster(title, save_dir)

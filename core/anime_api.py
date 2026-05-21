@@ -1,10 +1,15 @@
 from __future__ import annotations
+import os
 import re
+import ast
 import time
 import random
 import logging
+import asyncio
+import subprocess
+from pathlib import Path
 from typing import Optional, List, Dict, Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 import aiohttp
@@ -12,13 +17,11 @@ import cloudscraper
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from core.config import (
-    HEADERS, YTDLP_HEADERS, ANILIST_API, WORKER_BASE_URL, PAHE_LINKS_WORKER_URL
-)
+from core.config import HEADERS, ANILIST_API
 
 logger = logging.getLogger(__name__)
 
-
+KWIK_USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
 
 @retry(
     stop=stop_after_attempt(3),
@@ -26,7 +29,7 @@ logger = logging.getLogger(__name__)
     reraise=True
 )
 async def search_anime(query: str) -> Optional[List[Dict[str, Any]]]:
-    search_url = f"https://animepahe.com/api?m=search&q={quote(query)}"
+    search_url = f"https://animepahe.pw/api?m=search&q={quote(query)}"
     
     async with aiohttp.ClientSession() as session:
         async with session.get(search_url, headers=HEADERS) as response:
@@ -38,26 +41,23 @@ async def search_anime(query: str) -> Optional[List[Dict[str, Any]]]:
             
             return data.get('data', [])
 
-
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
     reraise=True
 )
 async def get_episode_list(session_id: str, page: int = 1) -> Dict[str, Any]:
-    episodes_url = f"https://animepahe.com/api?m=release&id={session_id}&sort=episode_asc&page={page}"
+    episodes_url = f"https://animepahe.pw/api?m=release&id={session_id}&sort=episode_asc&page={page}"
     
     async with aiohttp.ClientSession() as session:
         async with session.get(episodes_url, headers=HEADERS) as response:
             response.raise_for_status()
             return await response.json()
 
-
 def get_latest_releases(page=1):
-    releases_url = f"https://animepahe.com/api?m=airing&page={page}"
+    releases_url = f"https://animepahe.pw/api?m=airing&page={page}"
     response = requests.get(releases_url, headers=HEADERS).json()
     return response
-
 
 async def get_all_episodes(anime_session):
     all_episodes = []
@@ -72,7 +72,6 @@ async def get_all_episodes(anime_session):
             break
         page += 1
     return all_episodes
-
 
 def find_closest_episode(episodes, target_episode):
     try:
@@ -105,15 +104,230 @@ def find_closest_episode(episodes, target_episode):
     
     return closest
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=4, max=10),
+    reraise=True
+)
+def get_stream_links(anime_session: str, episode_session: str) -> Optional[List[Dict[str, Any]]]:
+    if '-' in episode_session:
+        episode_url = f"https://animepahe.pw/play/{episode_session}"
+    else:
+        episode_url = f"https://animepahe.pw/play/{anime_session}/{episode_session}"
+    
+    try:
+        session = cloudscraper.create_scraper(
+            browser={'browser': 'chrome', 'platform': 'linux', 'mobile': False}
+        )
+        session.headers.update(HEADERS)
+        time.sleep(random.uniform(1, 3))
+        
+        local_headers = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
+        }
+        session.headers.update(local_headers)
+        session.get("https://animepahe.pw/")
+        
+        logger.info(f"Fetching episode page: {episode_url}")
+        response = session.get(episode_url)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        buttons = soup.select('#resolutionMenu button[data-src]')
+        
+        if not buttons:
+            buttons = soup.select('button.dropdown-item[data-src]')
+        
+        if not buttons:
+            buttons = soup.select('button[data-src*="kwik"]')
+        
+        if not buttons:
+            logger.error(f"No stream buttons found for episode: {episode_url}")
+            logger.debug(f"Page sample: {response.text[:2000]}")
+            return None
+        
+        stream_links = []
+        for btn in buttons:
+            src = btn.get('data-src', '')
+            fansub = btn.get('data-fansub', 'Unknown')
+            resolution = btn.get('data-resolution', '0')
+            audio = btn.get('data-audio', 'jpn')
+            av1 = btn.get('data-av1', '0')
+            text = btn.get_text(strip=True)
+            
+            if src and 'kwik' in src:
+                stream_links.append({
+                    'url': src,
+                    'fansub': fansub,
+                    'resolution': int(resolution) if resolution.isdigit() else 0,
+                    'audio': audio,
+                    'av1': av1,
+                    'text': text
+                })
+        
+        if stream_links:
+            logger.info(f"Found {len(stream_links)} stream links: {[(s['resolution'], s['audio']) for s in stream_links]}")
+            return stream_links
+        
+        logger.error(f"No valid kwik stream links found for episode: {episode_url}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error getting stream links: {str(e)}")
+        logger.error(f"URL attempted: {episode_url}")
+        raise
 
+def _unpack_js(p, a, c, k, e=None, d=None):
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    
+    def base_encode(n):
+        rem = n % a
+        digit = chr(rem + 29) if rem > 35 else digits[rem]
+        if n < a:
+            return digit
+        return base_encode(n // a) + digit
 
-def extract_resolution_from_text(text: str) -> Optional[int]:
-    import re
-    match = re.search(r'(\d{3,4})p', text)
-    if match:
-        return int(match.group(1))
-    return None
+    d = {} if d is None else d
+    for i in range(c - 1, -1, -1):
+        key = base_encode(i)
+        d[key] = k[i] if i < len(k) and k[i] else key
 
+    pattern = re.compile(r'\b\w+\b')
+    def replace(m):
+        w = m.group(0)
+        return d.get(w, w)
+
+    return pattern.sub(replace, p)
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=3, max=8),
+    reraise=True
+)
+def extract_m3u8_from_kwik(kwik_url: str) -> Optional[Dict[str, Any]]:
+    try:
+        parsed_url = urlparse(kwik_url)
+        kwik_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        
+        animepahe_referer = "https://animepahe.pw/"
+        
+        headers = {
+            "Referer": animepahe_referer,
+            "User-Agent": KWIK_USER_AGENT
+        }
+        
+        logger.info(f"Extracting m3u8 from: {kwik_url}")
+        
+        session = cloudscraper.create_scraper(
+            browser={'browser': 'chrome', 'platform': 'linux', 'mobile': False}
+        )
+        session.headers.update(headers)
+        
+        response = session.get(kwik_url, timeout=30, allow_redirects=True)
+        response.raise_for_status()
+        
+        html_text = response.text
+        
+        m3u8_url = None
+        
+        all_packed = re.findall(
+            r"eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)",
+            html_text, re.DOTALL
+        )
+        
+        logger.info(f"Found {len(all_packed)} packed JS blocks in kwik page")
+        
+        for block_idx, (p, a_str, c_str, k_str) in enumerate(all_packed):
+            try:
+                a = int(a_str)
+                c = int(c_str)
+                k = k_str.split('|')
+                decoded = _unpack_js(p, a, c, k)
+                
+                if 'm3u8' not in decoded:
+                    logger.debug(f"Block {block_idx}: no m3u8 found, skipping")
+                    continue
+                
+                logger.info(f"Block {block_idx}: contains m3u8, searching for URL...")
+                
+                for pat in [
+                    r"const\s+source\s*=\s*'(https?://[^']+\.m3u8[^']*)'",
+                    r'const\s+source\s*=\s*"(https?://[^"]+\.m3u8[^"]*)"',
+                    r"source\s*=\s*'(https?://[^']+\.m3u8[^']*)'",
+                    r'source\s*=\s*"(https?://[^"]+\.m3u8[^"]*)"',
+                    r"file['\"]?\s*[:=]\s*['\"]?(https?://[^'\"]+\.m3u8[^'\"]*)",
+                    r"(https?://[^\s'\"\\)]+\.m3u8[^\s'\"\\)]*)",
+                ]:
+                    match = re.search(pat, decoded)
+                    if match and match.group(1):
+                        m3u8_url = match.group(1)
+                        logger.info(f"Found m3u8 URL in block {block_idx}")
+                        break
+                
+                if m3u8_url:
+                    break
+                    
+            except Exception as e:
+                logger.warning(f"Failed to unpack block {block_idx}: {e}")
+                continue
+        
+        if not m3u8_url:
+            for pat in [
+                r"source='(https?://[^']+\.m3u8[^']*)'",
+                r'source="(https?://[^"]+\.m3u8[^"]*)"',
+                r"(https?://[^\s'\"<>]+\.m3u8[^\s'\"<>]*)",
+            ]:
+                match = re.search(pat, html_text)
+                if match and match.group(1):
+                    m3u8_url = match.group(1)
+                    logger.info(f"Found m3u8 in raw HTML")
+                    break
+        
+        if not m3u8_url:
+            logger.error(f"Could not extract m3u8 URL from: {kwik_url}")
+            logger.debug(f"HTML sample: {html_text[:2000]}")
+            return None
+        
+        logger.info(f"Successfully extracted m3u8: {m3u8_url[:80]}...")
+        
+        kwik_referer = f"{kwik_domain}/"
+        return {
+            'm3u8_url': m3u8_url,
+            'headers': {
+                "Referer": kwik_referer,
+                "User-Agent": KWIK_USER_AGENT,
+            }
+        }
+        
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout extracting m3u8 from: {kwik_url}")
+        raise
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error extracting m3u8: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error extracting m3u8 from {kwik_url}: {e}")
+        raise
+
+async def download_m3u8(m3u8_url: str, headers: Dict[str, str], output_path: str, 
+                        progress_callback=None) -> bool:
+    import os
+    
+    from core.downloader import download_m3u8 as _robust_download_m3u8
+    
+    return await _robust_download_m3u8(
+        m3u8_url=m3u8_url,
+        output_path=output_path,
+        headers=headers,
+        cookies=None,
+        progress_callback=progress_callback,
+        progress_interval=3.0,
+        timeout=1800,
+    )
 
 def map_resolution_to_quality_tier(resolution: int) -> str:
     if resolution <= 360:
@@ -123,367 +337,51 @@ def map_resolution_to_quality_tier(resolution: int) -> str:
     else:
         return "1080p"
 
-
-def find_best_link_for_quality(download_links: List[Dict[str, Any]], target_quality: str) -> Optional[Dict[str, Any]]:
-    target_value = int(target_quality[:-1])
+def get_quality_streams(stream_links: List[Dict[str, Any]], enabled_qualities: List[str], 
+                        preferred_audio: str = "jpn") -> Dict[str, Dict[str, Any]]:
+    filtered = [s for s in stream_links if s['audio'] == preferred_audio]
     
-    for link in download_links:
-        if target_quality in link['text']:
-            return link
+    if not filtered:
+        filtered = stream_links
+        logger.warning(f"No streams found for audio '{preferred_audio}', using all available")
     
-    candidates = []
-    for link in download_links:
-        resolution = extract_resolution_from_text(link['text'])
-        if resolution:
-            mapped_tier = map_resolution_to_quality_tier(resolution)
-            if mapped_tier == target_quality:
-                candidates.append((resolution, link))
-    
-    if not candidates:
-        return None
-    
-    candidates.sort(key=lambda x: x[0])
-    
-    if target_quality == "360p":
-        return candidates[0][1]
-    else:
-        return candidates[-1][1]
-
-
-def get_available_qualities_with_mapping(download_links: List[Dict[str, Any]], enabled_qualities: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
     result = {}
     for quality in enabled_qualities:
-        result[quality] = find_best_link_for_quality(download_links, quality)
+        target_value = int(quality[:-1])
+        
+        exact = [s for s in filtered if s['resolution'] == target_value]
+        if exact:
+            result[quality] = exact[0]
+            continue
+        
+        candidates = [(s['resolution'], s) for s in filtered 
+                     if map_resolution_to_quality_tier(s['resolution']) == quality]
+        
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            if quality == "360p":
+                result[quality] = candidates[0][1]
+            else:
+                result[quality] = candidates[-1][1]
+    
     return result
 
-
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=4, max=10),
-    reraise=True
-)
-def get_download_links(anime_session, episode_session):
-    if '-' in episode_session:
-        episode_url = f"https://animepahe.com/play/{episode_session}"
-    else:
-        episode_url = f"https://animepahe.com/play/{anime_session}/{episode_session}"
+def detect_audio_type(stream_links: List[Dict[str, Any]]) -> str:
+    has_eng = any(s['audio'] == 'eng' for s in stream_links)
+    has_jpn = any(s['audio'] == 'jpn' for s in stream_links)
     
-    try:
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        time.sleep(random.uniform(2, 5))
-        local_headers = {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Upgrade-Insecure-Requests': '1',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache'
-        }
-        session.headers.update(local_headers)
-        session.get("https://animepahe.com/")
-        logger.info(f"Fetching episode page: {episode_url}")
-        response = session.get(episode_url)
-        response.raise_for_status()
-        
-        for parser in ['lxml', 'html.parser', 'html5lib']:
-            try:
-                soup = BeautifulSoup(response.content, parser)
-                break
-            except:
-                continue
-        
-        links = []
-        
-        selectors = [
-            "#pickDownload a.dropdown-item",
-            "#downloadMenu a",
-            "a[download]",
-            "a.btn-download",
-            "a[href*='download']",
-            ".download-wrapper a"
-        ]
-        
-        for selector in selectors:
-            elements = soup.select(selector)
-            if elements:
-                logger.info(f"Found {len(elements)} links with selector: {selector}")
-                for element in elements:
-                    href = element.get('href') or element.get('data-url') or element.get('data-href')
-                    if href:
-                        if not href.startswith('http'):
-                            href = f"https://animepahe.com{href}"
-                        links.append({
-                            'text': element.get_text(strip=True),
-                            'href': href
-                        })
-        
-        if not links:
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                text = a.get_text(strip=True)
-                if any(keyword in href.lower() or keyword in text.lower() 
-                      for keyword in ['download', 'kwik.cx', 'video', 'player']):
-                    if not href.startswith('http'):
-                        href = f"https://animepahe.com{href}"
-                    links.append({
-                        'text': text or 'Download',
-                        'href': href
-                    })
-        
-        if links:
-            logger.info(f"Found {len(links)} download links")
-            return links
-        
-        logger.error(f"No download links found for episode {episode_url}")
-        logger.debug(f"Page content sample: {response.text[:1000]}")
-        return None
-        
-    except Exception as e:
-        logger.error(f"Error getting download links: {str(e)}")
-        logger.error(f"URL attempted: {episode_url}")
-        return None
+    if has_eng and not has_jpn:
+        return "Dub"
+    return "Sub"
 
-def step_2(s, seperator, base=10):
-    mapped_range = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
-    numbers = mapped_range[0:base]
-    max_iter = 0
-    for index, value in enumerate(s[::-1]):
-        max_iter += int(value if value.isdigit() else 0) * (seperator**index)
-    mid = ''
-    while max_iter > 0:
-        mid = numbers[int(max_iter % base)] + mid
-        max_iter = (max_iter - (max_iter % base)) / base
-    return mid or '0'
-
-def step_1(data, key, load, seperator):
-    payload = ""
-    i = 0
-    seperator = int(seperator)
-    load = int(load)
-    while i < len(data):
-        s = ""
-        while data[i] != key[seperator]:
-            s += data[i]
-            i += 1
-        for index, value in enumerate(key):
-            s = s.replace(value, str(index))
-        payload += chr(int(step_2(s, seperator, 10)) - load)
-        i += 1
-    payload = re.findall(
-        r'action="([^\"]+)" method="POST"><input type="hidden" name="_token"\s+value="([^\"]+)', payload
-    )[0]
-    return payload
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    reraise=True
-)
-def get_dl_link(link):
-    try:
-        if link and link.startswith("WORKER_RESOLVED:"):
-            final_mp4_url = link.replace("WORKER_RESOLVED:", "")
-            logger.info(f"Using Worker-resolved MP4 URL: {final_mp4_url[:80]}...")
-            return WORKER_BASE_URL + final_mp4_url
-        
-        time.sleep(random.uniform(1, 3))
-
-        scraper = cloudscraper.create_scraper(
-            browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
-            interpreter='nodejs'
-        )
-
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'same-origin',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0'
-        }
-        
-        scraper.get("https://animepahe.com/", headers=headers)
-        
-        resp = scraper.get(link, headers=headers)
-        
-        patterns = [
-            r'\("([^"]+)",(\d+),"([^"]+)",(\d+),(\d+)',
-            r'\("(\S+)",\d+,"(\S+)",(\d+),(\d+)'
-        ]
-        
-        match = None
-        for pattern in patterns:
-            match = re.search(pattern, resp.text)
-            if match:
-                break
-        
-        if not match:
-            logger.error(f"Could not find required pattern in response from {link}")
-            return None
-        
-        if len(match.groups()) == 5:
-            data, _, key, load, seperator = match.groups()
-        else:
-            data, key, load, seperator = match.groups()
-        
-        url, token = step_1(data=data, key=key, load=load, seperator=seperator)
-
-        post_url = url if url.startswith('http') else f"https://kwik.cx{url}"
-        data = {"_token": token}
-        post_headers = {
-            'referer': link,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Origin': 'https://kwik.cx'
-        }
-        
-        resp = scraper.post(url=post_url, data=data, headers=post_headers, allow_redirects=False)
-        
-        if 'location' in resp.headers:
-            direct_link = resp.headers["location"]
-            return WORKER_BASE_URL + direct_link
-        
-        resp = scraper.post(url=post_url, data=data, headers=post_headers, allow_redirects=True)
-        
-        if resp.url != post_url and not resp.url.startswith('https://kwik.cx/'):
-            direct_link = resp.url
-            return WORKER_BASE_URL + direct_link
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"Error getting direct link: {str(e)}")
-        raise
-
-def extract_kwik_link_via_worker(pahe_win_url: str) -> Optional[str]:
-    if not PAHE_LINKS_WORKER_URL:
-        logger.error("PAHE_LINKS_WORKER_URL not configured")
-        return None
+def get_sub_dub_streams(stream_links: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    sub_streams = [s for s in stream_links if s['audio'] == 'jpn']
+    dub_streams = [s for s in stream_links if s['audio'] == 'eng']
     
-    try:
-        from urllib.parse import urlencode, quote
-        
-        worker_url = f"{PAHE_LINKS_WORKER_URL.rstrip('/')}/?url={quote(pahe_win_url, safe='')}"
-        
-        logger.info(f"Calling Worker API to resolve pahe.win URL: {pahe_win_url}")
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'application/json',
-        }
-        
-        response = requests.get(worker_url, headers=headers, timeout=60)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        if data.get('status') == 'success':
-            final_mp4_url = data.get('final_mp4_url')
-            original_kwik = data.get('original_kwik')
-            
-            if final_mp4_url:
-                logger.info(f"Worker API resolved to MP4: {final_mp4_url[:80]}...")
-                return f"WORKER_RESOLVED:{final_mp4_url}"
-            elif original_kwik:
-                logger.info(f"Worker API returned kwik URL: {original_kwik}")
-                return original_kwik
-        
-        error_msg = data.get('error', 'Unknown error from Worker API')
-        logger.error(f"Worker API error: {error_msg}")
-        return None
-        
-    except requests.exceptions.Timeout:
-        logger.error(f"Worker API timeout for URL: {pahe_win_url}")
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Worker API request error: {str(e)}")
-        return None
-    except Exception as e:
-        logger.error(f"Worker API unexpected error: {str(e)}")
-        return None
-
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    reraise=True
-)
-def extract_kwik_link(url):
-    if 'pahe.win' in url or 'pahe.cx' in url:
-        result = extract_kwik_link_via_worker(url)
-        if result:
-            return result
-        logger.warning(f"Worker API failed for {url}, will retry...")
-        raise Exception(f"Worker API failed to resolve: {url}")
-    
-    try:
-        time.sleep(random.uniform(1, 3))
-        
-        scraper = cloudscraper.create_scraper(
-            browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
-            interpreter='nodejs'
-        )
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'same-origin',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0',
-            'Referer': 'https://animepahe.com/'
-        }
-        
-        scraper.get("https://animepahe.com/", headers=headers)
-        
-        response = scraper.get(url, headers=headers)
-        response.raise_for_status()
-        
-        logger.info(f"Got response from {url}, status code: {response.status_code}")
-        
-        for parser in ['lxml', 'html.parser', 'html5lib']:
-            try:
-                soup = BeautifulSoup(response.text, parser)
-                logger.info(f"Parsed with {parser}")
-                break
-            except Exception as e:
-                logger.warning(f"Parser {parser} failed: {str(e)}")
-                continue
-        
-        for script in soup.find_all('script'):
-            if script.string:
-                match = re.search(r'https://kwik\.cx/f/[\w\d-]+', script.string)
-                if match:
-                    return match.group(0)
-        
-        download_elements = soup.select('a[href*="kwik.cx"], a[onclick*="kwik.cx"]')
-        for element in download_elements:
-            href = element.get('href') or element.get('onclick', '')
-            match = re.search(r'https://kwik\.cx/f/[\w\d-]+', href)
-            if match:
-                return match.group(0)
-        
-        page_text = str(soup)
-        matches = re.findall(r'https://kwik\.cx/f/[\w\d-]+', page_text)
-        if matches:
-            return matches[0]
-        
-        return None
-    except Exception as e:
-        logger.error(f"Error extracting kwik link: {str(e)}")
-        raise
-
-
+    return {
+        'sub': sub_streams,
+        'dub': dub_streams
+    }
 
 async def get_anime_info(title: str) -> Dict[str, Any]:
     query = """
@@ -526,6 +424,7 @@ query ($id: Int, $search: String, $seasonYear: Int) {
     }
     updatedAt
     coverImage {
+      extraLarge
       large
     }
     bannerImage
@@ -561,49 +460,121 @@ query ($id: Int, $search: String, $seasonYear: Int) {
       url
       site
     }
+    relations {
+      edges {
+        relationType
+        node {
+          id
+          bannerImage
+        }
+      }
+    }
     siteUrl
   }
 }
+
 """
-    
-    variables = {
-        'search': title
-    }
-    
+
+    variables = {'search': title}
+    url = 'https://graphql.anilist.co'
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(ANILIST_API, json={'query': query, 'variables': variables}) as response:
-                data = await response.json()
-                if data.get('data', {}).get('Media'):
-                    return data['data']['Media']
+            async with session.post(url, json={'query': query, 'variables': variables}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    logger.error(f"AniList API returned {resp.status}")
+                    return {}
+                data = await resp.json()
+                media = data.get('data', {}).get('Media', {})
+                return media if media else {}
     except Exception as e:
         logger.error(f"Error fetching anime info from AniList: {e}")
-    
-    return None
+        return {}
 
 
-async def download_anime_poster(anime_title: str) -> Optional[str]:
-    from core.config import THUMBNAIL_DIR
-    from core.utils import sanitize_filename
-    
+def find_closest_episode(episodes: List[Dict], target_episode: int) -> Optional[Dict]:
+    if not episodes:
+        return None
+
+    exact = None
+    for ep in episodes:
+        try:
+            ep_num = int(ep.get('episode', 0))
+            if ep_num == target_episode:
+                exact = ep
+                break
+        except (ValueError, TypeError):
+            continue
+
+    if exact:
+        return exact
+
+    closest = None
+    min_diff = float('inf')
+    for ep in episodes:
+        try:
+            ep_num = int(ep.get('episode', 0))
+            diff = abs(ep_num - target_episode)
+            if diff < min_diff:
+                min_diff = diff
+                closest = ep
+        except (ValueError, TypeError):
+            continue
+
+    return closest
+
+
+async def download_anime_poster(title: str, save_dir: str = None) -> Optional[str]:
     try:
-        anime_info = await get_anime_info(anime_title)
-        if not anime_info:
+        info = await get_anime_info(title)
+        if not info:
             return None
-        
-        poster_url = anime_info.get('coverImage', {}).get('large')
-        if not poster_url:
+
+        image_url = info.get('bannerImage')
+
+        if not image_url:
+            relations = info.get('relations', {}).get('edges', [])
+            for rel in relations:
+                if rel.get('relationType') in ('PREQUEL', 'PARENT', 'SOURCE'):
+                    node_banner = rel.get('node', {}).get('bannerImage')
+                    if node_banner:
+                        image_url = node_banner
+                        break
+            if not image_url:
+                for rel in relations:
+                    node_banner = rel.get('node', {}).get('bannerImage')
+                    if node_banner:
+                        image_url = node_banner
+                        break
+
+        if not image_url:
+            cover_image = info.get('coverImage', {})
+            if cover_image:
+                image_url = cover_image.get('extraLarge') or cover_image.get('large') or cover_image.get('medium')
+
+        if not image_url:
             return None
+
+        if save_dir is None:
+            save_dir = str(Path(__file__).parent.parent / "thumbnails")
+
+        os.makedirs(save_dir, exist_ok=True)
+        safe_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')[:50]
+        save_path = os.path.join(save_dir, f"{safe_title}_poster.jpg")
+
+        if os.path.exists(save_path) and os.path.getsize(save_path) > 1000:
+            return save_path
 
         async with aiohttp.ClientSession() as session:
-            async with session.get(poster_url) as response:
-                if response.status == 200:
-                    import os
-                    poster_path = os.path.join(THUMBNAIL_DIR, f"{sanitize_filename(anime_title)}.jpg")
-                    with open(poster_path, 'wb') as f:
-                        f.write(await response.read())
-                    return poster_path
+            async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    with open(save_path, 'wb') as f:
+                        f.write(data)
+                    if os.path.getsize(save_path) > 1000:
+                        return save_path
+
+        return None
     except Exception as e:
         logger.error(f"Error downloading anime poster: {e}")
-    
-    return None
+        return None

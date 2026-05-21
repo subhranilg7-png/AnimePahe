@@ -1,7 +1,5 @@
 Telethon
 pyrofork
-yt-dlp
-cloudscraper
 beautifulsoup4
 lxml
 pymongo
@@ -9,10 +7,10 @@ python-dotenv
 requests
 aiohttp
 schedule
-fastapi
-uvicorn
 tenacity
 Pillow
 motor
 pytz
 tgcrypto
+yt-dlp
+cloudscraper

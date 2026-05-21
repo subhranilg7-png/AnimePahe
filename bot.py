@@ -4,9 +4,7 @@ import logging
 from datetime import datetime
 
 import aiohttp
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-import uvicorn
+from aiohttp import web
 
 from core.config import PORT, BOT_TOKEN, START_PIC_URL
 from core.client import client
@@ -17,20 +15,54 @@ from core.scheduler import setup_scheduler
 logger = logging.getLogger(__name__)
 health_logger = logging.getLogger('health_monitor')
 
-app = FastAPI()
+_start_time = datetime.now()
 
+routes = web.RouteTableDef()
 
-@app.get("/health")
-async def health_check():
-    return JSONResponse(
-        status_code=200,
-        content={"status": "healthy", "message": "𝙼𝚊𝚜𝚝𝚎𝚛, 𝚢𝚘𝚞𝚛 𝚜𝚎𝚛𝚟𝚊𝚗𝚝 𝚒𝚜 𝚘𝚗𝚌𝚎 𝚊𝚐𝚊𝚒𝚗 𝚊𝚕𝚒𝚟𝚎.― 𝙼𝚒𝚛𝚊𝚐𝚎 𝙱𝚘𝚝𝚜"}
-    )
+@routes.get("/", allow_head=True)
+async def root_handler(request):
+    uptime = str(datetime.now() - _start_time).split('.')[0]
+    return web.json_response({
+        "status": "alive",
+        "service": "AutoAnime-Bot",
+        "uptime": uptime
+    })
 
+@routes.get("/health")
+async def health_handler(request):
+    uptime = str(datetime.now() - _start_time).split('.')[0]
+    return web.json_response({
+        "status": "healthy",
+        "uptime": uptime,
+        "version": "3.0.0",
+        "platform": "huggingface"
+    })
+
+@routes.get("/status")
+async def status_handler(request):
+    uptime = str(datetime.now() - _start_time).split('.')[0]
+    return web.json_response({
+        "bot": "running",
+        "uptime": uptime,
+        "version": "3.0.0",
+        "platform": "huggingface"
+    })
+
+async def start_web_server():
+    app = web.Application()
+    app.add_routes(routes)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    
+    logger.info(f"Web server running on port {PORT}")
+    return runner
 
 async def _health_monitor_loop():
     health_url = f"http://127.0.0.1:{PORT}/health"
-    consecutive_failures = 0
     
     await asyncio.sleep(30)
     health_logger.info(f"Health monitor started - pinging {health_url} every 60s")
@@ -40,44 +72,19 @@ async def _health_monitor_loop():
             async with aiohttp.ClientSession() as session:
                 async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        consecutive_failures = 0
-                        health_logger.debug(
-                            f"Health OK: status={resp.status}, "
-                            f"response={data.get('status', 'unknown')}, "
-                            f"time={datetime.now().strftime('%H:%M:%S')}"
-                        )
+                        health_logger.debug(f"Health OK at {datetime.now().strftime('%H:%M:%S')}")
                     else:
-                        consecutive_failures += 1
-                        health_logger.warning(
-                            f"Health WARN: status={resp.status}, "
-                            f"consecutive_failures={consecutive_failures}, "
-                            f"time={datetime.now().strftime('%H:%M:%S')}"
-                        )
+                        health_logger.warning(f"Health WARN: status={resp.status}")
         except asyncio.CancelledError:
-            health_logger.info("Health monitor cancelled")
             return
         except Exception as e:
-            consecutive_failures += 1
-            health_logger.error(
-                f"Health FAIL: error={str(e)}, "
-                f"consecutive_failures={consecutive_failures}, "
-                f"time={datetime.now().strftime('%H:%M:%S')}"
-            )
-
-        if consecutive_failures >= 3:
-            health_logger.error(
-                f"Health CRITICAL: {consecutive_failures} consecutive failures - service may be down"
-            )
+            health_logger.error(f"Health FAIL: {str(e)}")
         
         await asyncio.sleep(60)
 
-
 async def main():
     try:
-
-        server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info"))
-        asyncio.create_task(server.serve())
+        await start_web_server()
         
         register_handlers()
         
@@ -87,6 +94,7 @@ async def main():
         logger.info("𝙇𝙤𝙖𝙙𝙞𝙣𝙜..")
         await asyncio.sleep(1.5)
         logger.info("𝙇𝙤𝙖𝙙𝙞𝙣𝙜...")
+        
         setup_scheduler(client)
         
         asyncio.create_task(_health_monitor_loop())
@@ -104,6 +112,6 @@ async def main():
         await asyncio.sleep(15)
         await main()
 
-
 if __name__ == '__main__':
     asyncio.run(main())
+

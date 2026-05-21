@@ -10,62 +10,492 @@ import schedule
 from zoneinfo import ZoneInfo
 
 from core.config import (
-    DOWNLOAD_DIR, YTDLP_HEADERS, ADMIN_CHAT_ID,
+    DOWNLOAD_DIR, ADMIN_CHAT_ID,
     CHANNEL_USERNAME, BOT_USERNAME, CHANNEL_NAME,
     DUMP_CHANNEL_ID, DUMP_CHANNEL_USERNAME
 )
 from core.client import client, FFMPEG_AVAILABLE, currently_processing
 from core.state import (
     auto_download_state, quality_settings, anime_queue,
-    episode_tracker, EpisodeState
+    episode_tracker, EpisodeState, deferred_episodes
 )
 from core.utils import (
     sanitize_filename, format_filename, format_size, format_speed,
     get_fixed_thumbnail, is_episode_processed, update_processed_qualities, mark_episode_processed,
-    ProgressMessage, UploadProgressBar, safe_edit
+    ProgressMessage, UploadProgressBar, safe_edit,
+    generate_batch_link, generate_single_link
 )
 from core.anime_api import (
     search_anime, get_all_episodes, get_latest_releases,
-    get_download_links, extract_kwik_link, get_dl_link, get_anime_info,
-    find_closest_episode, find_best_link_for_quality, get_available_qualities_with_mapping
+    get_stream_links, extract_m3u8_from_kwik, download_m3u8,
+    get_quality_streams, detect_audio_type, get_anime_info,
+    find_closest_episode, map_resolution_to_quality_tier
 )
 from core.download import (
-    rename_video_with_ffmpeg, post_anime_with_buttons, robust_upload_file
+    rename_video_with_ffmpeg, robust_upload_file
 )
 
 logger = logging.getLogger(__name__)
 
-try:
-    import yt_dlp
-except ImportError:
-    logger.error("yt-dlp not installed")
-
 from telethon.errors import FloodWaitError
-
+from telethon.tl.custom import Button
 
 _currently_processing = False
 _scheduler_lock = asyncio.Lock() if asyncio else None
 
+_request_time_job_tag = "daily_request_processing"
 
 def get_currently_processing():
-    global _currently_processing
     return _currently_processing
-
 
 def set_currently_processing(value: bool):
     global _currently_processing
     _currently_processing = value
 
-
 def _get_scheduler_lock():
     global _scheduler_lock
     if _scheduler_lock is None:
-        try:
-            _scheduler_lock = asyncio.Lock()
-        except RuntimeError:
-            pass
+        _scheduler_lock = asyncio.Lock()
     return _scheduler_lock
 
+
+async def _get_best_image(anime_info):
+    if not anime_info:
+        return None
+
+    banner = anime_info.get('coverImage')
+    if banner:
+        return banner
+
+    relations = anime_info.get('relations', {}).get('edges', [])
+    for rel in relations:
+        node_banner = rel.get('node', {}).get('coverImage')
+        if node_banner:
+            return node_banner
+
+    try:
+        import aiohttp
+        anilist_id = anime_info.get('id')
+        if not anilist_id:
+            cover_data = anime_info.get('coverImage', {})
+            return cover_data.get('extraLarge') or cover_data.get('large')
+
+        query = """
+query ($id: Int) {
+  Media(id: $id, type: ANIME) {
+    relations {
+      edges {
+        relationType
+        node {
+          id
+          bannerImage
+        }
+      }
+    }
+  }
+}
+"""
+        visited = {anilist_id}
+        queue = []
+        for rel in relations:
+            if rel.get('relationType') in ('PREQUEL', 'PARENT'):
+                nid = rel.get('node', {}).get('id')
+                if nid and nid not in visited:
+                    queue.append(nid)
+                    visited.add(nid)
+
+        url = 'https://graphql.anilist.co'
+        async with aiohttp.ClientSession() as session:
+            for _ in range(5):
+                if not queue:
+                    break
+                current_id = queue.pop(0)
+                async with session.post(url, json={'query': query, 'variables': {'id': current_id}}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    media = data.get('data', {}).get('Media', {})
+                    if not media:
+                        continue
+                    edges = media.get('relations', {}).get('edges', [])
+                    for rel in edges:
+                        node = rel.get('node', {})
+                        nb = node.get('bannerImage')
+                        if nb:
+                            return nb
+                        if rel.get('relationType') in ('PREQUEL', 'PARENT'):
+                            nid = node.get('id')
+                            if nid and nid not in visited:
+                                queue.append(nid)
+                                visited.add(nid)
+    except Exception as e:
+        logger.warning(f"Error walking prequel chain for banner: {e}")
+
+    cover_data = anime_info.get('coverImage', {})
+    return cover_data.get('extraLarge') or cover_data.get('large')
+
+async def post_anime_with_buttons(client, anime_title, anime_info, episode_number, audio_type, quality_files):
+    from core.config import CHANNEL_ID, CHANNEL_USERNAME, FIXED_THUMBNAIL_URL
+
+    channel_target = CHANNEL_ID or CHANNEL_USERNAME
+    if not channel_target:
+        logger.warning("No main channel configured for posting")
+        return
+
+    channel_format = (CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
+
+    try:
+        title_romaji = anime_title
+        title_english = ""
+        genres = ""
+        score = ""
+        studios = ""
+
+        if anime_info:
+            titles = anime_info.get('title', {})
+            title_romaji = titles.get('romaji', anime_title)
+            title_english = titles.get('english', '')
+            genres = ', '.join(anime_info.get('genres', [])[:4])
+            score = anime_info.get('averageScore', '')
+            studio_nodes = anime_info.get('studios', {}).get('nodes', [])
+            studios = ', '.join([s['name'] for s in studio_nodes[:2]]) if studio_nodes else ''
+
+        if audio_type == "Sub":
+            audio_alpha = "Japanese"
+        else:
+            audio_alpha = "English"
+
+        caption = (
+            f"<b><blockquote>✦ {title_english} ✦</blockquote>\n"
+            f"──────────────────\n"
+            f"<blockquote>"
+        )
+        caption += f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
+        caption += f"・ Aᴜᴅɪᴏ: {audio_alpha}\n"
+        if genres:
+            caption += f"・ Gᴇɴʀᴇs: {genres}</blockquote>\n"
+        caption += (
+            f"──────────────────\n"
+            f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>"
+        )
+
+        button_list = []
+        sorted_qualities = sorted(quality_files.keys(), key=lambda x: int(x[:-1]))
+
+        for quality in sorted_qualities:
+            msg_ids = quality_files[quality]
+            if not msg_ids:
+                continue
+
+            if len(msg_ids) == 1:
+                link = await generate_single_link(msg_ids[0])
+            else:
+                link = await generate_batch_link(msg_ids)
+
+            quality_map = {
+                "360p": "𝟯𝟲𝟬𝗣",
+                "720p": "𝟳𝟮𝟬𝗣",
+                "1080p": "𝟭𝟬𝟴𝟬𝗣"
+            }
+
+            quality_btn = quality_map.get(quality, quality)
+
+            if link:
+                button_list.append(Button.url(f"{quality_btn}", link))
+
+        if not button_list:
+            logger.error("No valid download links generated for buttons")
+            return
+
+        buttons = _arrange_buttons(button_list)
+
+        poster_path = None
+
+        ani_id = anime_info.get("id") if anime_info else None
+        image_url = f"https://img.anili.st/media/{ani_id}" if ani_id else None
+
+        if image_url:
+            import aiohttp
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status == 200:
+                            poster_path = os.path.join(DOWNLOAD_DIR, f"poster_{sanitize_filename(anime_title)}.jpg")
+                            with open(poster_path, 'wb') as f:
+                                f.write(await resp.read())
+            except Exception as e:
+                logger.warning(f"Failed to download poster: {e}")
+
+        if poster_path and os.path.exists(poster_path):
+            await client.send_file(
+                channel_target,
+                poster_path,
+                caption=caption,
+                parse_mode='html',
+                buttons=buttons,
+                link_preview=False
+            )
+            try:
+                os.remove(poster_path)
+            except:
+                pass
+        else:
+            await client.send_message(
+                channel_target,
+                caption,
+                parse_mode='html',
+                buttons=buttons,
+                link_preview=False
+            )
+
+        logger.info(f"Posted {anime_title} Episode {episode_number} to channel with {len(button_list)} quality buttons")
+
+    except FloodWaitError as e:
+        logger.warning(f"Flood wait during post: {e.seconds}s")
+        await asyncio.sleep(e.seconds + 5)
+        raise
+    except Exception as e:
+        logger.error(f"Error posting anime with buttons: {e}")
+        raise
+
+
+def _arrange_buttons(button_list):
+    if len(button_list) == 1:
+        return [[button_list[0]]]
+    elif len(button_list) == 2:
+        return [[button_list[0], button_list[1]]]
+    else:
+        rows = []
+        i = 0
+        while i < len(button_list):
+            if i + 1 < len(button_list):
+                rows.append([button_list[i], button_list[i + 1]])
+                i += 2
+            else:
+                rows.append([button_list[i]])
+                i += 1
+        return rows
+
+async def post_anime_batch_with_buttons(client, anime_title, anime_info, quality_files, total_episodes, audio_type):
+    from core.config import CHANNEL_ID, CHANNEL_USERNAME
+
+    channel_target = CHANNEL_ID or CHANNEL_USERNAME
+    if not channel_target:
+        logger.warning("No main channel configured for posting")
+        return
+
+    channel_format = (CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
+
+    try:
+        title_romaji = anime_title
+        title_english = ""
+        genres = ""
+
+        if anime_info:
+            titles = anime_info.get('title', {})
+            title_romaji = titles.get('romaji', anime_title)
+            title_english = titles.get('english', '')
+            genres = ', '.join(anime_info.get('genres', [])[:4])
+
+        if audio_type == "Sub":
+            audio_alpha = "Japanese"
+        else:
+            audio_alpha = "English"
+
+        caption = (
+            f"<b><blockquote>✦ {title_romaji} ✦</blockquote>\n"
+            f"──────────────────\n"
+            f"<blockquote>"
+            f"・ Eᴘɪsᴏᴅᴇs: 1-{total_episodes}\n"
+            f"・ Aᴜᴅɪᴏ: {audio_alpha}\n"
+        )
+        if genres:
+            caption += f"・ Gᴇɴʀᴇs: {genres}</blockquote>\n"
+        caption += (
+            f"──────────────────\n"
+            f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>"
+        )
+
+        button_list = []
+        sorted_qualities = sorted(quality_files.keys(), key=lambda x: int(x[:-1]))
+
+        for quality in sorted_qualities:
+            msg_ids = quality_files[quality]
+            if not msg_ids:
+                continue
+
+            if len(msg_ids) == 1:
+                link = await generate_single_link(msg_ids[0])
+            else:
+                link = await generate_batch_link(msg_ids)
+
+            quality_map = {
+                "360p": "𝟯𝟲𝟬𝗣",
+                "720p": "𝟳𝟮𝟬𝗣",
+                "1080p": "𝟭𝟬𝟴𝟬𝗣"
+            }
+
+            quality_btn = quality_map.get(quality, quality)
+
+            if link:
+                button_list.append(Button.url(f"{quality} - {total_episodes} Episodes", link))
+
+        if not button_list:
+            logger.error("No valid download links for batch buttons")
+            return
+
+        buttons = _arrange_buttons(button_list)
+
+        poster_path = None
+
+        ani_id = anime_info.get("id") if anime_info else None
+        image_url = f"https://img.anili.st/media/{ani_id}" if ani_id else None
+
+        if image_url:
+            import aiohttp
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status == 200:
+                            poster_path = os.path.join(DOWNLOAD_DIR, f"poster_{sanitize_filename(anime_title)}_batch.jpg")
+                            with open(poster_path, 'wb') as f:
+                                f.write(await resp.read())
+            except Exception as e:
+                logger.warning(f"Failed to download batch poster: {e}")
+
+        if poster_path and os.path.exists(poster_path):
+            await client.send_file(
+                channel_target,
+                poster_path,
+                caption=caption,
+                parse_mode='html',
+                buttons=buttons,
+                link_preview=False
+            )
+            try:
+                os.remove(poster_path)
+            except:
+                pass
+        else:
+            await client.send_message(
+                channel_target,
+                caption,
+                parse_mode='html',
+                buttons=buttons,
+                link_preview=False
+            )
+
+        logger.info(f"Posted batch: {anime_title} ({total_episodes} episodes) to channel")
+
+    except Exception as e:
+        logger.error(f"Error posting anime batch with buttons: {e}")
+
+async def _download_and_upload_single_quality(
+    anime_title, episode_number, quality, stream_info, audio_type, progress=None, channel_format=""
+):
+    download_path = None
+    try:
+        kwik_url = stream_info['url']
+        resolution = stream_info['resolution']
+        
+        if progress:
+            await progress.update(
+                f"<b><blockquote>✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗜𝗡𝗚 ✦</blockquote>\n"
+                f"──────────────────\n"
+                f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
+                f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
+                f"・ Qᴜᴀʟɪᴛʏ: {quality} ({audio_type})\n"
+                f"・ Sᴛᴀᴛᴜs: Exᴛʀᴀᴄᴛɪɴɢ sᴛʀᴇᴀᴍ URL...</blockquote>\n"
+                f"──────────────────\n"
+                f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
+                parse_mode='html'
+            )
+        
+        m3u8_data = await asyncio.to_thread(extract_m3u8_from_kwik, kwik_url)
+        if not m3u8_data:
+            logger.error(f"Failed to extract m3u8 from {kwik_url}")
+            return None
+        
+        m3u8_url = m3u8_data['m3u8_url']
+        m3u8_headers = m3u8_data['headers']
+        
+        base_name = format_filename(anime_title, episode_number, quality, audio_type)
+        main_channel_username = CHANNEL_USERNAME if CHANNEL_USERNAME else BOT_USERNAME
+        full_caption = f"**{base_name} {main_channel_username}.mkv**"
+        filename = sanitize_filename(full_caption)
+        download_path = os.path.join(DOWNLOAD_DIR, filename)
+        
+        from core.dl_progress import FFmpegProgressReporter, make_upload_status_text
+        dl_reporter = FFmpegProgressReporter(
+            progress_message=progress,
+            anime_title=anime_title,
+            episode_number=episode_number,
+            quality=quality,
+            audio_type=audio_type,
+            channel_format=channel_format,
+        )
+        
+        download_start = time.time()
+        success = await download_m3u8(m3u8_url, m3u8_headers, download_path,
+                                       progress_callback=dl_reporter.callback)
+        
+        if not success:
+            logger.error(f"M3U8 download failed for {quality}")
+            return None
+        
+        if not os.path.exists(download_path) or os.path.getsize(download_path) < 1000:
+            logger.error(f"Downloaded file is too small or doesn't exist for {quality}")
+            return None
+        
+        download_time = time.time() - download_start
+        file_size = os.path.getsize(download_path)
+        avg_speed = file_size / download_time if download_time > 0 else 0
+        
+        logger.info(f"Download complete: {quality} - {format_size(file_size)} in {download_time:.1f}s ({format_speed(avg_speed)})")
+        
+        async def _upload_progress(current, total):
+            if not progress:
+                return
+            pct = int(current * 100 / total) if total else 0
+            bar_fill = pct // 5
+            bar = "█" * bar_fill + "░" * (20 - bar_fill)
+            status = f"[{bar}] {pct}% — {format_size(current)}/{format_size(total)}"
+            text = make_upload_status_text(
+                anime_title, episode_number, quality, audio_type,
+                total, channel_format, extra_status=status,
+            )
+            await progress.update(text, parse_mode='html')
+        
+        thumb = await get_fixed_thumbnail()
+        
+        dump_msg_id = await robust_upload_file(
+            file_path=download_path,
+            caption=full_caption,
+            thumb_path=thumb,
+            max_retries=3,
+            progress_callback=_upload_progress,
+        )
+        
+        try:
+            os.remove(download_path)
+        except:
+            pass
+        
+        if dump_msg_id:
+            logger.info(f"Successfully uploaded {quality} version: msg_id={dump_msg_id}")
+            return dump_msg_id
+        else:
+            logger.error(f"Upload failed for {quality}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error in _download_and_upload_single_quality for {quality}: {e}")
+        try:
+            if download_path and os.path.exists(download_path):
+                os.remove(download_path)
+        except:
+            pass
+        return None
 
 async def auto_download_latest_episode():
     global _currently_processing
@@ -136,645 +566,44 @@ async def auto_download_latest_episode():
                 )
             return True
         
-        search_results = await search_anime(anime_title)
-        if not search_results:
-            logger.error(f"Anime not found: {anime_title}")
-            if progress:
-                await progress.update(f"<b><blockquote>ᴀɴɪᴍᴇ ɴᴏᴛ ғᴏᴜɴᴅ: {anime_title}</b></blockquote>", parse_mode='html')
-            return False
+        success = await process_specific_anime(latest_anime, progress)
         
-        anime_info = search_results[0]
-        anime_session = anime_info['session']
-        
-        episodes = await get_all_episodes(anime_session)
-        if not episodes:
-            logger.error(f"Failed to get episode list for {anime_title}")
-            if progress:
-                await progress.update(f"<b><blockquote>ғᴀɪʟᴇᴅ ᴛᴏ ɢᴇᴛ ᴇᴘɪsᴏᴅᴇ ʟɪsᴛ ғᴏʀ: {anime_title}</b></blockquote>", parse_mode='html')
-            return False
-        
-        target_episode = None
-        for ep in episodes:
-            try:
-                if int(ep['episode']) == episode_number:
-                    target_episode = ep
-                    break
-            except (ValueError, TypeError):
-                continue
-        
-        if not target_episode:
-            logger.warning(f"Episode {episode_number} not found for {anime_title}. Looking for closest available.")
-            target_episode = find_closest_episode(episodes, episode_number)
-            if target_episode:
-                actual_episode = int(target_episode['episode'])
-                logger.info(f"Found closest episode: {actual_episode}")
-                episode_number = actual_episode
-            else:
-                logger.error(f"No episodes found for {anime_title}")
-                if progress:
-                    await progress.update(f"<b><blockquote>ɴᴏ ᴇᴘɪsᴏᴅᴇs ғᴏᴜɴᴅ ғᴏʀ: {anime_title}<b><blockquote>", parse_mode='html')
-                return False
-        
-        episode_session = target_episode['session']
-        
-        download_links = get_download_links(anime_session, episode_session)
-        if not download_links:
-            logger.error(f"No download links found for {anime_title} Episode {episode_number}")
-            if progress:
-                await progress.update(f"<b><blockquote>ɴᴏ ᴅᴏᴡɴʟᴏᴀᴅ ʟɪɴᴋs ғᴏᴜɴᴅ ғᴏʀ: ᴀɴɪᴍᴇ: {anime_title} | ᴇᴘɪsᴏᴅᴇ: {episode_number}<b><blockquote>", parse_mode='htmls')
-            return False
-        
-        enabled_qualities = quality_settings.enabled_qualities
-
-        if progress:
-            await progress.update(f"<b><blockquote>ᴄʜᴇᴄᴋɪɴɢ ǫᴜᴀʟɪᴛʏ ᴀᴠᴀɪʟᴀʙɪʟɪᴛʏ ғᴏʀ: ᴀɴɪᴍᴇ: {anime_title} | ᴇᴘɪsᴏᴅᴇ: {episode_number}<b><blockquote>", parse_mode='html')
-        
-        quality_mapping = get_available_qualities_with_mapping(download_links, enabled_qualities)
-        
-        available_qualities = [q for q, link in quality_mapping.items() if link is not None]
-        missing_qualities = [q for q, link in quality_mapping.items() if link is None]
-        
-        logger.info(f"Quality mapping result - Available: {available_qualities}, Missing: {missing_qualities}")
-        logger.info(f"Download links available: {[link['text'] for link in download_links]}")
-        
-        is_dub = any('eng' in link['text'].lower() for link in download_links)
-        audio_type = "Dub" if is_dub else "Sub"
-        
-        if missing_qualities:
-            logger.warning(
-                f"SKIPPING {anime_title} Ep{episode_number}: not all selected qualities available yet. "
-                f"Available: {available_qualities}, Missing: {missing_qualities}"
-            )
-            logger.info(f"Source links: {[link['text'] for link in download_links]}")
-            
-            if progress:
-                await progress.update(
-                    f"<b><blockquote>✦ 𝗪𝗔𝗜𝗧𝗜𝗡𝗚 ✦</blockquote>\n"
-                    f"──────────────────\n"
-                    f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                    f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                    f"・ Aᴠᴀɪʟᴀʙʟᴇ: {', '.join(available_qualities) if available_qualities else 'None'}\n"
-                    f"・ Mɪssɪɴɢ: {', '.join(missing_qualities)}\n"
-                    f"・ Sᴛᴀᴛᴜs: Wᴀɪᴛɪɴɢ ғᴏʀ ᴀʟʟ ǫᴜᴀʟɪᴛɪᴇs</blockquote>\n"
-                    f"──────────────────\n"
-                    f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                    parse_mode='html'
-                )
-            
-            return False
-        
-        if not available_qualities:
-            logger.warning(f"No qualities available (even with adaptive mapping) for {anime_title} Episode {episode_number}")
-            
-            queue_info = {
-                'title': anime_title,
-                'episode': episode_number,
-                'session': anime_session,
-                'episode_session': episode_session,
-                'available_qualities': [],
-                'missing_qualities': enabled_qualities,
-                'audio_type': audio_type
-            }
-            
-            anime_queue.add_to_pending(queue_info)
-            
-            if progress:
-                await progress.update(
-                    f"<b><blockquote>✦ 𝗤𝗨𝗘𝗨𝗘 ✦</blockquote>\n"
-                    f"──────────────────\n"
-                    f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                    f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                    f"・ Aᴠᴀɪʟᴀʙʟᴇ:  {', '.join(available_qualities)}\n"
-                    f"・ Mɪssɪɴɢ: {', '.join(missing_qualities)}\n"
-                    f"・ Qᴜᴇᴜᴇ sɪᴢᴇ: {len(anime_queue.pending_queue)}\n"
-                    f"・ Sᴛᴀᴛᴜs: Wᴀɪᴛɪɴɢ</blockquote>\n"
-                    f"──────────────────\n"
-                    f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                    parse_mode='html'
-                )
-            
-            return await check_and_process_next_episode(progress)
-        
-        logger.info(f"All qualities available for {anime_title} Episode {episode_number}: {available_qualities}")
-        
-        if progress:
-            await progress.update(
-                f"<b><blockquote>✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗜𝗡𝗚 ✦</blockquote>\n"
-                f"──────────────────\n"
-                f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                f"・ Aᴠᴀɪʟᴀʙʟᴇ:  {', '.join(available_qualities)}\n"
-                f"・ Sᴛᴀᴛᴜs: Dᴏᴡɴʟᴏᴀᴅɪɴɢ</blockquote>\n"
-                f"──────────────────\n"
-                f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                parse_mode='html'
-            )
-        
-        sorted_qualities = sorted(available_qualities, key=lambda x: int(x[:-1]))
-        
-        downloaded_qualities = []
-        quality_files = {}
-        
-        for quality_idx, quality in enumerate(sorted_qualities):
-            try:
-                logger.info(f"Downloading {anime_title} Episode {episode_number} {quality}")
-                
-                if progress:
-                    await progress.update(
-                        f"<b><blockquote>✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗜𝗡𝗚 ✦</blockquote>\n"
-                        f"──────────────────\n"
-                        f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                        f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                        f"・ Aᴠᴀɪʟᴀʙʟᴇ:  {', '.join(available_qualities)}\n"
-                        f"・ Qᴜᴀʟɪᴛʏ: {quality} - ({quality_idx + 1}/{len(sorted_qualities)})\n"
-                        f"・ Aᴜᴅɪᴏ:  {audio_type}\n"
-                        f"・ Sᴛᴀᴛᴜs: Fɪɴᴅɪɴɢ ʟɪɴᴋs</blockquote>\n"
-                        f"──────────────────\n"
-                        f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                        parse_mode='html'
-                    )
-                
-                quality_link = quality_mapping.get(quality)
-                
-                if not quality_link:
-                    logger.warning(f"Quality {quality} not available for {anime_title} Episode {episode_number}, skipping")
-                    continue
-                
-                base_name = format_filename(anime_title, episode_number, quality, "Sub" if not is_dub else "Dub")
-                main_channel_username = CHANNEL_USERNAME if CHANNEL_USERNAME else BOT_USERNAME
-                full_caption = f"**{base_name} {main_channel_username}.mkv**"
-                filename = sanitize_filename(full_caption)
-                download_path = os.path.join(DOWNLOAD_DIR, filename)
-
-                if progress:
-                    await progress.update(
-                        f"<b><blockquote>✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗜𝗡𝗚 ✦</blockquote>\n"
-                        f"──────────────────\n"
-                        f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                        f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                        f"・ Aᴠᴀɪʟᴀʙʟᴇ:  {', '.join(available_qualities)}\n"
-                        f"・ Qᴜᴀʟɪᴛʏ: {quality} - ({quality_idx + 1}/{len(sorted_qualities)})\n"
-                        f"・ Aᴜᴅɪᴏ:  {audio_type}\n"
-                        f"・ Sᴛᴀᴛᴜs: Exᴛʀᴀᴄᴛɪɴɢ ᴅɪʀᴇᴄᴛ ʟɪɴᴋs...</blockquote>\n"
-                        f"──────────────────\n"
-                        f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                        parse_mode='html'
-                    )
-                
-                kwik_link = extract_kwik_link(quality_link['href'])
-                if not kwik_link:
-                    logger.error(f"Failed to extract kwik link for {quality}")
-                    continue
-                
-                direct_link = get_dl_link(kwik_link)
-                if not direct_link:
-                    logger.error(f"Failed to get direct link for {quality}")
-                    continue
-                
-                if progress:
-                    await progress.update(
-                        f"<b><blockquote>✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗜𝗡𝗚 ✦</blockquote>\n"
-                        f"──────────────────\n"
-                        f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                        f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                        f"・ Aᴠᴀɪʟᴀʙʟᴇ:  {', '.join(available_qualities)}\n"
-                        f"・ Qᴜᴀʟɪᴛʏ: {quality} - ({quality_idx + 1}/{len(sorted_qualities)})\n"
-                        f"・ Aᴜᴅɪᴏ:  {audio_type}\n"
-                        f"・ Sᴛᴀᴛᴜs: Oᴘᴛɪᴍɪᴢᴇᴅ ᴅᴏᴡɴʟᴏᴀᴅɪɴɢ...</blockquote>\n"
-                        f"──────────────────\n"
-                        f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                        parse_mode='html'
-                    )
-                
-                last_update = time.time()
-                download_start = time.time()
-                
-                def progress_hook(d):
-                    nonlocal last_update
-                    if d['status'] == 'downloading':
-                        current_time = time.time()
-                        if current_time - last_update >= 3:
-                            downloaded_bytes = d.get('downloaded_bytes')
-                            total_bytes = d.get('total_bytes')
-                            speed = d.get('speed')
-                            
-                            downloaded = downloaded_bytes if downloaded_bytes is not None else 0
-                            total = total_bytes if total_bytes is not None else 1
-                            speed_val = speed if speed is not None else 0
-                            
-                            try:
-                                downloaded = int(downloaded)
-                                total = int(total)
-                                speed_val = float(speed_val)
-                            except (ValueError, TypeError):
-                                downloaded = 0
-                                total = 1
-                                speed_val = 0.0
-
-                            if total > 0:
-                                percent = min(100, (downloaded / total) * 100)
-                            else:
-                                percent = 0
-                            
-                            if progress:
-                                progress_text = (
-                                    f"<b><blockquote>✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗜𝗡𝗚 ✦</blockquote>\n"
-                                    f"──────────────────\n"
-                                    f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                                    f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                                    f"・ Aᴠᴀɪʟᴀʙʟᴇ:  {', '.join(available_qualities)}\n"
-                                    f"・ Qᴜᴀʟɪᴛʏ: {quality} - ({quality_idx + 1}/{len(sorted_qualities)})\n"
-                                    f"・ Aᴜᴅɪᴏ:  {audio_type}\n"
-                                    f"・ Sᴛᴀᴛᴜs: Dᴏᴡɴʟᴏᴀᴅɪɴɢ...</blockquote>\n"
-                                    f"<blockquote>・ Pʀᴏɢʀᴇss: {percent:.1f}%\n"
-                                    f"・ Sɪᴢᴇ: {format_size(downloaded)}/{format_size(total)}\n"
-                                    f"・ Sᴘᴇᴇᴅ: {format_speed(speed_val)}%</blockquote>\n"
-                                    f"──────────────────\n"
-                                    f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                                )
-                                
-                                try:
-                                    asyncio.create_task(progress.update(progress_text, parse_mode='html'))
-                                except:
-                                    pass
-                            
-                            last_update = current_time
-                
-                ydl_opts_optimized = {
-                    'outtmpl': download_path,
-                    'quiet': True,
-                    'no_warnings': True,
-                    'http_headers': YTDLP_HEADERS,
-                    'progress_hooks': [progress_hook],
-                    'nocheckcertificate': True,
-                    'compat_opts': ['no-keep-video'],
-                    'concurrent_fragment_downloads': 16,
-                    'fragment_retries': 10,
-                    'retries': 10,
-                    'downloader_args': {
-                        'chunk_size': 16777216,
-                        'connections': 16,
-                        'continue_dl': True
-                    },
-                    'socket_timeout': 30,
-                    'buffersize': 16384,
-                }
-                
-                download_success = False
-                try:
-                    ydl_opts_aria = {
-                        'outtmpl': download_path,
-                        'quiet': True,
-                        'no_warnings': True,
-                        'http_headers': YTDLP_HEADERS,
-                        'progress_hooks': [progress_hook],
-                        'nocheckcertificate': True,
-                        'compat_opts': ['no-keep-video'],
-                        'external_downloader': 'aria2c',
-                        'external_downloader_args': {
-                            'aria2c': [
-                                '--max-connection-per-server=16',
-                                '--max-concurrent-downloads=8', 
-                                '--split=8',
-                                '--min-split-size=1M',
-                                '--max-download-limit=0',
-                                '--file-allocation=none',
-                                '--continue=true',
-                                '--auto-file-renaming=false',
-                                '--allow-overwrite=true',
-                                '--max-tries=5',
-                                '--retry-wait=3',
-                                '--timeout=60',
-                                '--connect-timeout=30'
-                            ]
-                        }
-                    }
-                    
-                    with yt_dlp.YoutubeDL(ydl_opts_aria) as ydl:
-                        ydl.download([direct_link])
-                    download_success = True
-                    logger.info(f"Downloaded {quality} using aria2c successfully")
-                    
-                except Exception as aria_error:
-                    logger.warning(f"Aria2c not available or failed: {aria_error}")
-                    try:
-                        with yt_dlp.YoutubeDL(ydl_opts_optimized) as ydl:
-                            ydl.download([direct_link])
-                        download_success = True
-                        logger.info(f"Downloaded {quality} using optimized yt-dlp")
-                    except Exception as fallback_error:
-                        logger.warning(f"Optimized download failed: {fallback_error}")
-                        ydl_opts_basic = {
-                            'outtmpl': download_path,
-                            'quiet': True,
-                            'no_warnings': True,
-                            'http_headers': YTDLP_HEADERS,
-                            'progress_hooks': [progress_hook],
-                            'nocheckcertificate': True,
-                            'compat_opts': ['no-keep-video'],
-                            'downloader_args': {'chunk_size': 10485760},
-                        }
-                        
-                        with yt_dlp.YoutubeDL(ydl_opts_basic) as ydl:
-                            ydl.download([direct_link])
-                        download_success = True
-                
-                if not os.path.exists(download_path) or os.path.getsize(download_path) < 1000:
-                    logger.error(f"Downloaded file is too small or doesn't exist for {quality}")
-                    continue
-                
-                if FFMPEG_AVAILABLE:
-                    final_path = os.path.join(DOWNLOAD_DIR, f"[E{episode_number:02d}] - {anime_title} [{quality}].mkv")
-                    if await rename_video_with_ffmpeg(download_path, final_path):
-                        os.remove(download_path)
-                        download_path = final_path
-                
-                caption = full_caption
-                
-                thumb = await get_fixed_thumbnail()
-                
-                dump_msg_id = await robust_upload_file(
-                    file_path=download_path,
-                    caption=caption,
-                    thumb_path=thumb,
-                    max_retries=3
-                )
-                
-                if dump_msg_id:
-                    if quality not in quality_files:
-                        quality_files[quality] = []
-                    quality_files[quality].append(dump_msg_id)
-                    
-                    update_processed_qualities(anime_title, episode_number, quality)
-                    downloaded_qualities.append(quality)
-                    logger.info(f"Successfully uploaded {quality} version: msg_id={dump_msg_id}")
-                    
-                    try:
-                        os.remove(download_path)
-                    except:
-                        pass
-                else:
-                    logger.error(f"Upload FAILED for {quality} - keeping file for retry")
-                
-            except Exception as e:
-                logger.error(f"Error processing {quality}: {e}")
-        
-        failed_qualities = [q for q in sorted_qualities if q not in downloaded_qualities]
-        
-        if failed_qualities:
-            logger.error(
-                f"EPISODE MARKED FAILED: {anime_title} Ep{episode_number} - "
-                f"{len(failed_qualities)} qualities failed: {failed_qualities}. "
-                f"Successful: {downloaded_qualities}. No post created. No re-download."
-            )
-            
-            for q in failed_qualities:
-                try:
-                    base_name = format_filename(anime_title, episode_number, q, audio_type)
-                    main_channel_username = CHANNEL_USERNAME if CHANNEL_USERNAME else BOT_USERNAME
-                    potential_filename = sanitize_filename(f"**{base_name} {main_channel_username}.mkv**")
-                    potential_path = os.path.join(DOWNLOAD_DIR, potential_filename)
-                    if os.path.exists(potential_path):
-                        os.remove(potential_path)
-                        logger.info(f"Cleaned up failed file: {potential_path}")
-                except Exception as cleanup_err:
-                    logger.warning(f"Cleanup error for {q}: {cleanup_err}")
-            
-            if progress:
-                await progress.update(
-                    f"<b><blockquote>✦ 𝗙𝗔𝗜𝗟𝗘𝗗 ✦</blockquote>\n"
-                    f"──────────────────\n"
-                    f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                    f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                    f"・ Sᴜᴄᴄᴇss: {', '.join(downloaded_qualities) if downloaded_qualities else 'None'}\n"
-                    f"・ Fᴀɪʟᴇᴅ: {', '.join(failed_qualities)}\n"
-                    f"・ Sᴛᴀᴛᴜs: Fᴀɪʟᴇᴅ ᴀғᴛᴇʀ 3 ʀᴇᴛʀɪᴇs - sᴋɪᴘᴘᴇᴅ</blockquote>\n"
-                    f"──────────────────\n"
-                    f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                    parse_mode='html'
-                )
-            return False
-        
-        if quality_files and len(downloaded_qualities) == len(sorted_qualities):
-            anime_info = await get_anime_info(anime_title)
-            await post_anime_with_buttons(client, anime_title, anime_info, episode_number, audio_type, quality_files)
-            
-            logger.info(f"All {len(downloaded_qualities)} qualities processed for {anime_title} Episode {episode_number}")
-            
-            if progress:
-                await progress.update(
-                    f"<b><blockquote>✦ 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘 ✦</blockquote>\n"
-                    f"──────────────────\n"
-                    f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                    f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                    f"・ Qᴜᴀʟɪᴛɪᴇs: {', '.join(downloaded_qualities)}\n"
-                    f"・ Sᴛᴀᴛᴜs: Pᴏsᴛᴇᴅ ✓</blockquote>\n"
-                    f"──────────────────\n"
-                    f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                    parse_mode='html'
-                )
-            return True
-        else:
-            logger.error(f"Unexpected state: quality_files={bool(quality_files)}, downloaded={len(downloaded_qualities)}, expected={len(sorted_qualities)}")
-            return False
-    
-    except Exception as e:
-        logger.error(f"Error in auto download process: {e}")
-        if progress:
-            await progress.update(
-                f"<b>Error in auto download process:</b> <i>{str(e)}</i>",
-                parse_mode='html'
-            )
-        return False
-    finally:
-        _currently_processing = False
-
-
-async def check_and_process_next_episode(progress=None):
-    try:
-        logger.info("Checking for other new episodes to process...")
-        channel_format = (CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
-        
-        latest_data = get_latest_releases(page=1)
-        if not latest_data or 'data' not in latest_data:
-            return False
-        
-        for idx, anime_data in enumerate(latest_data['data']):
-            if idx >= 5:
-                break
-                
-            anime_title = anime_data.get('anime_title', 'Unknown Anime')
-            episode_number = anime_data.get('episode', 0)
-            
-            if anime_queue.is_processed(anime_title, episode_number):
-                continue
-            
-            episode_id = f"{anime_title}_{episode_number}"
-            if episode_id in [item['id'] for item in anime_queue.pending_queue]:
-                continue
-            
-            logger.info(f"Found unprocessed episode: {anime_title} Episode {episode_number}")
-            
-            if progress:
-                await progress.update(
-                f"<b><blockquote>✦ 𝗘𝗣𝗜𝗦𝗢𝗗𝗘 𝗖𝗛𝗘𝗖𝗞𝗜𝗡𝗚 ✦</blockquote>\n"
-                f"──────────────────\n"
-                f"<blockquote>・ Aɴɪᴍᴇ: {anime_title} \n"
-                f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                f"・ Sᴛᴀᴛᴜs: Cʜᴇᴄᴋɪɴɢ</blockquote>\n"
-                f"──────────────────\n"
-                f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                parse_mode='html'
-            )
-            
-            success = await process_single_episode(anime_title, episode_number, progress)
-            if success:
-                return True
-        
-        return await process_pending_queue(progress)
-        
-    except Exception as e:
-        logger.error(f"Error checking next episode: {e}")
-        return False
-
-
-async def process_pending_queue(progress=None):
-    try:
-        channel_format = (CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
-        pending_item = anime_queue.get_next_pending()
-        if not pending_item:
-            logger.info("No items in pending queue")
-            return False
-        
-        logger.info(f"Processing from queue: {pending_item['id']}")
-        
-        if progress:
-            await progress.update(
-                f"<b><blockquote>✦ 𝗤𝗨𝗘𝗨𝗘 ✦</blockquote>\n"
-                f"──────────────────\n"
-                f"<blockquote>・ Aɴɪᴍᴇ: {pending_item['title']}\n"
-                f"・ Eᴘɪsᴏᴅᴇ: {pending_item['episode']}\n"
-                f"・ Qᴜᴇᴜᴇ sɪᴢᴇ: {len(anime_queue.pending_queue)}\n"
-                f"・ Sᴛᴀᴛᴜs: Pʀᴏᴄᴇssɪɴɢ</blockquote>\n"
-                f"──────────────────\n"
-                f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                parse_mode='html'
-            )
-        
-        success = await process_single_episode(
-            pending_item['title'],
-            pending_item['episode'],
-            progress,
-            from_queue=True
-        )
-        
-        if success:
-            anime_queue.remove_from_pending(pending_item['id'])
-            logger.info(f"Successfully processed from queue: {pending_item['id']}")
-        else:
-            pending_item['last_checked'] = datetime.now().isoformat()
-            anime_queue.save_queue()
-        
+        auto_download_state.last_checked = datetime.now().isoformat()
         return success
         
     except Exception as e:
-        logger.error(f"Error processing pending queue: {e}")
-        return False
-
-
-async def process_single_episode(anime_title, episode_number, progress=None, from_queue=False):
-    global _currently_processing
-    channel_format = (CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
-    try:
-        if _currently_processing:
-            logger.info("Already processing an episode. Adding to queue.")
-            return False
-        
-        _currently_processing = True
-
-        search_results = await search_anime(anime_title)
-        if not search_results:
-            logger.error(f"Anime not found: {anime_title}")
-            return False
-        
-        anime_info = search_results[0]
-        anime_session = anime_info['session']
-        
-        episodes = await get_all_episodes(anime_session)
-        if not episodes:
-            logger.error(f"Failed to get episode list for {anime_title}")
-            return False
-        
-        target_episode = None
-        for ep in episodes:
-            try:
-                if int(ep['episode']) == episode_number:
-                    target_episode = ep
-                    break
-            except (ValueError, TypeError):
-                continue
-        
-        if not target_episode:
-            logger.error(f"Episode {episode_number} not found for {anime_title}")
-            return False
-        
-        episode_session = target_episode['session']
-
-        download_links = get_download_links(anime_session, episode_session)
-        if not download_links:
-            logger.error(f"No download links found for {anime_title} Episode {episode_number}")
-            return False
-        
-        enabled_qualities = quality_settings.enabled_qualities
-        
-        quality_mapping = get_available_qualities_with_mapping(download_links, enabled_qualities)
-        available_qualities = [q for q, link in quality_mapping.items() if link is not None]
-        missing_qualities = [q for q, link in quality_mapping.items() if link is None]
-        
-        if missing_qualities:
-            logger.warning(
-                f"SKIPPING {anime_title} Ep{episode_number} in process_single_episode: "
-                f"not all selected qualities available. Available: {available_qualities}, Missing: {missing_qualities}"
-            )
-            
-            if not from_queue:
-                queue_info = {
-                    'title': anime_title,
-                    'episode': episode_number,
-                    'session': anime_session,
-                    'episode_session': episode_session,
-                    'available_qualities': available_qualities,
-                    'missing_qualities': missing_qualities,
-                    'audio_type': "Dub" if any('eng' in link['text'].lower() for link in download_links) else "Sub"
-                }
-                anime_queue.add_to_pending(queue_info)
-            
-            if progress:
-                await progress.update(
-                    f"<b><blockquote>✦ 𝗪𝗔𝗜𝗧𝗜𝗡𝗚 ✦</blockquote>\n"
-                    f"──────────────────\n"
-                    f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                    f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                    f"・ Aᴠᴀɪʟᴀʙʟᴇ: {', '.join(available_qualities) if available_qualities else 'None'}\n"
-                    f"・ Mɪssɪɴɢ: {', '.join(missing_qualities)}\n"
-                    f"・ Sᴛᴀᴛᴜs: Wᴀɪᴛɪɴɢ ғᴏʀ ᴀʟʟ ǫᴜᴀʟɪᴛɪᴇs</blockquote>\n"
-                    f"──────────────────\n"
-                    f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                    parse_mode='html'
-                )
-            
-            return False
-        
-        anime_queue.mark_as_processed(anime_title, episode_number)
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error processing episode: {e}")
+        logger.error(f"Error in auto_download_latest_episode: {e}")
+        if progress:
+            await progress.update(f"<b><blockquote>ᴇʀʀᴏʀ: {str(e)}</blockquote></b>", parse_mode='html')
         return False
     finally:
         _currently_processing = False
 
+async def check_and_process_next_episode(progress=None):
+    if anime_queue.pending_queue:
+        next_item = anime_queue.pending_queue[0]
+        anime_queue.pending_queue.pop(0)
+        
+        anime_data = {
+            'anime_title': next_item.get('title'),
+            'episode': next_item.get('episode')
+        }
+        return await process_specific_anime(anime_data, progress)
+    return False
+
+async def process_pending_queue(progress=None):
+    while anime_queue.pending_queue:
+        await check_and_process_next_episode(progress)
+        await asyncio.sleep(5)
+
+async def process_single_episode(anime_title, episode_number, progress=None, from_queue=False):
+    channel_format = (CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
+    
+    anime_data = {
+        'anime_title': anime_title,
+        'episode': episode_number
+    }
+    return await process_specific_anime(anime_data, progress)
 
 async def check_for_new_episodes(client):
     global _currently_processing
@@ -789,22 +618,53 @@ async def check_for_new_episodes(client):
         if scheduler_lock.locked():
             logger.info("Scheduler lock held by another task. Skipping this check.")
             return
-        
-        acquired = scheduler_lock.locked() == False
-        if not acquired:
-            logger.info("Could not acquire scheduler lock. Skipping this check.")
-            return
     
     if _currently_processing:
         logger.info("Already processing an episode. Skipping auto check.")
         return
     
     async with scheduler_lock if scheduler_lock else asyncio.Lock():
-        logger.info("Checking for new episodes and pending queue...")
+        _currently_processing = True
+        logger.info("Checking for new episodes, deferred episodes, and pending queue...")
         
         if anime_queue.pending_queue:
             logger.info(f"Processing {len(anime_queue.pending_queue)} pending episodes first...")
             await process_pending_queue()
+        
+        # Process deferred episodes first (these are waiting for all qualities to appear)
+        deferred_list = deferred_episodes.get_all_deferred()
+        if deferred_list:
+            logger.info(f"Checking {len(deferred_list)} deferred episodes for quality availability...")
+            deferred_episodes.cleanup_expired()
+            
+            for deferred_item in deferred_list:
+                d_title = deferred_item.get('anime_title')
+                d_episode = deferred_item.get('episode_number')
+                d_anime_data = deferred_item.get('anime_data', {})
+                
+                if is_episode_processed(d_title, d_episode):
+                    deferred_episodes.remove_episode(d_title, d_episode)
+                    continue
+                
+                if episode_tracker.is_posted(d_title, d_episode):
+                    deferred_episodes.remove_episode(d_title, d_episode)
+                    continue
+                
+                logger.info(f"Re-checking deferred: {d_title} Ep{d_episode} (check #{deferred_item.get('check_count', 0)})")
+                
+                if not episode_tracker.try_start_processing(d_title, d_episode):
+                    continue
+                
+                try:
+                    success = await process_specific_anime(d_anime_data, progress, _caller_holds_lock=True)
+                    if success:
+                        logger.info(f"Deferred episode now processed successfully: {d_title} Ep{d_episode}")
+                    else:
+                        episode_tracker.release_processing(d_title, d_episode, success=False)
+                        logger.info(f"Deferred episode still not ready: {d_title} Ep{d_episode}")
+                except Exception as e:
+                    logger.error(f"Error processing deferred {d_title} Ep{d_episode}: {e}")
+                    episode_tracker.release_processing(d_title, d_episode, success=False)
         
         try:
             if auto_download_state.last_checked:
@@ -827,15 +687,16 @@ async def check_for_new_episodes(client):
                 episode_number = anime_data.get('episode', 0)
                 
                 if is_episode_processed(anime_title, episode_number):
-                    logger.debug(f"Skipping {anime_title} Ep{episode_number}: already processed (old system)")
                     continue
                 
                 if episode_tracker.is_posted(anime_title, episode_number):
-                    logger.debug(f"Skipping {anime_title} Ep{episode_number}: already POSTED")
                     continue
                 
                 if episode_tracker.is_processing(anime_title, episode_number):
-                    logger.debug(f"Skipping {anime_title} Ep{episode_number}: currently PROCESSING")
+                    continue
+                
+                # Skip if already deferred (will be handled in deferred check above)
+                if deferred_episodes.is_deferred(anime_title, episode_number):
                     continue
                 
                 unprocessed_anime.append(anime_data)
@@ -881,7 +742,7 @@ async def check_for_new_episodes(client):
                     )
                 
                 try:
-                    success = await process_specific_anime(anime_data, progress)
+                    success = await process_specific_anime(anime_data, progress, _caller_holds_lock=True)
                     
                     if success:
                         processed_count += 1
@@ -899,11 +760,14 @@ async def check_for_new_episodes(client):
             
             auto_download_state.last_checked = datetime.now().isoformat()
             
+            deferred_count = len(deferred_episodes.get_all_deferred())
+            
             if progress:
                 await progress.update(
                     f"<b><blockquote>✦ 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘𝗗 ✦</blockquote>\n"
                     f"──────────────────\n"
                     f"<blockquote>・ Pʀᴏᴄᴇssᴇᴅ: {processed_count}\n"
+                    f"・ Dᴇғᴇʀʀᴇᴅ: {deferred_count}\n"
                     f"・ Fᴀɪʟᴇᴅ: {failed_count}\n"
                     f"・ Sᴋɪᴘᴘᴇᴅ: {skipped_count}\n"
                     f"・ Tᴏᴛᴀʟ: {len(unprocessed_anime)}</blockquote>\n"
@@ -912,7 +776,7 @@ async def check_for_new_episodes(client):
                     parse_mode='html'
                 )
             
-            logger.info(f"Batch processing complete: {processed_count} processed, {failed_count} failed, {skipped_count} skipped")
+            logger.info(f"Batch processing complete: {processed_count} processed, {failed_count} failed, {skipped_count} skipped, {deferred_count} deferred")
             
         except Exception as e:
             logger.error(f"Error checking for new episodes: {str(e)}")
@@ -921,25 +785,42 @@ async def check_for_new_episodes(client):
                     f"<b><blockquote>ᴇʀʀᴏʀ ᴘʀᴏᴄᴇssɪɴɢ ᴀɴɪᴍᴇ:</b> {str(e)}</blockquote>",
                     parse_mode='html'
                 )
+        finally:
+            _currently_processing = False
 
-
-async def process_specific_anime(anime_data: dict, progress=None) -> bool:
+async def process_specific_anime(anime_data: dict, progress=None, _caller_holds_lock: bool = False) -> bool:
     global _currently_processing
     channel_format = (CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
     
-    if _currently_processing:
-        logger.info("Already processing, skipping this anime for now")
-        return False
-    
-    _currently_processing = True
-    
     anime_title = anime_data.get('anime_title', 'Unknown Anime')
     episode_number = anime_data.get('episode', 0)
-    post_created = False
     
-    files_to_cleanup = []
+    # Check DB first - if already processed with all qualities, skip immediately
+    if is_episode_processed(anime_title, episode_number):
+        logger.info(f"Episode {episode_number} of {anime_title} already fully processed in DB. Skipping.")
+        if progress:
+            await progress.update(
+                f"<b><blockquote>✦ 𝗔𝗟𝗥𝗘𝗔𝗗𝗬 𝗣𝗥𝗢𝗖𝗘𝗦𝗦𝗘𝗗 ✦</blockquote>\n"
+                f"──────────────────\n"
+                f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
+                f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
+                f"・ Sᴛᴀᴛᴜs: Aʟʀᴇᴀᴅʏ ɪɴ DB</blockquote>\n"
+                f"──────────────────\n"
+                f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
+                parse_mode='html'
+            )
+        return True
+    
+    # Only acquire the processing lock if caller hasn't already done so
+    if not _caller_holds_lock:
+        if _currently_processing:
+            logger.info(f"Already processing another anime, skipping {anime_title} Ep{episode_number}")
+            return False
+        _currently_processing = True
     
     try:
+        logger.info(f"Starting processing: {anime_title} Episode {episode_number}")
+        
         search_results = await search_anime(anime_title)
         if not search_results:
             logger.error(f"Anime not found: {anime_title}")
@@ -972,39 +853,95 @@ async def process_specific_anime(anime_data: dict, progress=None) -> bool:
         
         episode_session = target_episode['session']
         
-        download_links = get_download_links(anime_session, episode_session)
-        if not download_links:
-            logger.error(f"No download links found for {anime_title} Episode {episode_number}")
+        if progress:
+            await progress.update(
+                f"<b><blockquote>✦ 𝗙𝗘𝗧𝗖𝗛𝗜𝗡𝗚 𝗦𝗧𝗥𝗘𝗔𝗠𝗦 ✦</blockquote>\n"
+                f"──────────────────\n"
+                f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
+                f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
+                f"・ Sᴛᴀᴛᴜs: Exᴛʀᴀᴄᴛɪɴɢ sᴛʀᴇᴀᴍ URLs...</blockquote>\n"
+                f"──────────────────\n"
+                f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
+                parse_mode='html'
+            )
+        
+        stream_links = await asyncio.to_thread(get_stream_links, anime_session, episode_session)
+        if not stream_links:
+            logger.error(f"No stream links found for {anime_title} Episode {episode_number}")
+            # Defer this episode - stream links not available yet
+            deferred_episodes.defer_episode(
+                anime_title, episode_number,
+                available_qualities=[],
+                missing_qualities=list(quality_settings.enabled_qualities),
+                anime_data=anime_data
+            )
+            if progress:
+                await progress.update(
+                    f"<b><blockquote>✦ 𝗗𝗘𝗙𝗘𝗥𝗥𝗘𝗗 ✦</blockquote>\n"
+                    f"──────────────────\n"
+                    f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
+                    f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
+                    f"・ Rᴇᴀsᴏɴ: Nᴏ sᴛʀᴇᴀᴍ ʟɪɴᴋs ʏᴇᴛ\n"
+                    f"・ Sᴛᴀᴛᴜs: Wɪʟʟ ʀᴇᴛʀʏ ʟᴀᴛᴇʀ</blockquote>\n"
+                    f"──────────────────\n"
+                    f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
+                    parse_mode='html'
+                )
             return False
         
         enabled_qualities = quality_settings.enabled_qualities
+        preferred_audio = "jpn"
         
-        quality_mapping = get_available_qualities_with_mapping(download_links, enabled_qualities)
+        quality_mapping = get_quality_streams(stream_links, enabled_qualities, preferred_audio)
+        available_qualities = [q for q, s in quality_mapping.items() if s is not None]
+        missing_qualities = [q for q in enabled_qualities if q not in available_qualities]
         
-        available_qualities = [q for q, link in quality_mapping.items() if link is not None]
-        missing_from_source = [q for q in enabled_qualities if q not in available_qualities]
+        audio_type = detect_audio_type(stream_links)
+        
+        logger.info(f"Quality mapping result - Available: {available_qualities}, Missing: {missing_qualities}")
         
         if not available_qualities:
             logger.error(f"No suitable qualities found for {anime_title} Episode {episode_number}")
-            logger.info(f"Available links: {[link['text'] for link in download_links]}")
-            logger.info(f"Enabled qualities: {enabled_qualities}")
-            return False
-        
-        if missing_from_source:
-            logger.warning(
-                f"SKIPPING {anime_title} Ep{episode_number}: not all selected qualities available yet. "
-                f"Available: {available_qualities}, Missing: {missing_from_source}"
+            # Defer - no qualities available at all
+            deferred_episodes.defer_episode(
+                anime_title, episode_number,
+                available_qualities=[],
+                missing_qualities=missing_qualities,
+                anime_data=anime_data
             )
-            logger.info(f"Source links: {[link['text'] for link in download_links]}")
-            logger.info(f"Enabled qualities: {enabled_qualities}")
             if progress:
                 await progress.update(
-                    f"<b><blockquote>✦ 𝗪𝗔𝗜𝗧𝗜𝗡𝗚 ✦</blockquote>\n"
+                    f"<b><blockquote>✦ 𝗗𝗘𝗙𝗘𝗥𝗥𝗘𝗗 ✦</blockquote>\n"
+                    f"──────────────────\n"
+                    f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
+                    f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
+                    f"・ Rᴇᴀsᴏɴ: Nᴏ ǫᴜᴀʟɪᴛɪᴇs ᴀᴠᴀɪʟᴀʙʟᴇ\n"
+                    f"・ Sᴛᴀᴛᴜs: Wɪʟʟ ʀᴇᴛʀʏ ʟᴀᴛᴇʀ</blockquote>\n"
+                    f"──────────────────\n"
+                    f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
+                    parse_mode='html'
+                )
+            return False
+        
+        # KEY LOGIC: If ANY selected quality is missing, DO NOT process the episode.
+        # Defer it and wait until ALL selected qualities have embed URLs available.
+        if missing_qualities:
+            logger.info(f"NOT processing {anime_title} Ep{episode_number}: missing qualities {missing_qualities}. "
+                       f"Available: {available_qualities}. Will retry later when all qualities are available.")
+            deferred_episodes.defer_episode(
+                anime_title, episode_number,
+                available_qualities=available_qualities,
+                missing_qualities=missing_qualities,
+                anime_data=anime_data
+            )
+            if progress:
+                await progress.update(
+                    f"<b><blockquote>✦ 𝗗𝗘𝗙𝗘𝗥𝗥𝗘𝗗 ✦</blockquote>\n"
                     f"──────────────────\n"
                     f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
                     f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
                     f"・ Aᴠᴀɪʟᴀʙʟᴇ: {', '.join(available_qualities)}\n"
-                    f"・ Mɪssɪɴɢ: {', '.join(missing_from_source)}\n"
+                    f"・ Mɪssɪɴɢ: {', '.join(missing_qualities)}\n"
                     f"・ Sᴛᴀᴛᴜs: Wᴀɪᴛɪɴɢ ғᴏʀ ᴀʟʟ ǫᴜᴀʟɪᴛɪᴇs</blockquote>\n"
                     f"──────────────────\n"
                     f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
@@ -1012,35 +949,35 @@ async def process_specific_anime(anime_data: dict, progress=None) -> bool:
                 )
             return False
         
-        logger.info(f"=== QUALITY PROCESSING PLAN for {anime_title} Ep{episode_number} ===")
-        logger.info(f"Enabled qualities: {enabled_qualities}")
-        logger.info(f"Available via mapping: {available_qualities}")
+        # All qualities are available! Remove from deferred list if it was there
+        if deferred_episodes.is_deferred(anime_title, episode_number):
+            deferred_episodes.remove_episode(anime_title, episode_number)
+            logger.info(f"All qualities now available for {anime_title} Ep{episode_number}, removed from deferred list")
         
-        is_dub = any('eng' in link['text'].lower() for link in download_links)
-        audio_type = "Dub" if is_dub else "Sub"
+        if progress:
+            await progress.update(
+                f"<b><blockquote>✦ 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗜𝗡𝗚 ✦</blockquote>\n"
+                f"──────────────────\n"
+                f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
+                f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
+                f"・ Aᴠᴀɪʟᴀʙʟᴇ: {', '.join(available_qualities)}\n"
+                f"・ Sᴛᴀᴛᴜs: Dᴏᴡɴʟᴏᴀᴅɪɴɢ</blockquote>\n"
+                f"──────────────────\n"
+                f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
+                parse_mode='html'
+            )
         
         sorted_qualities = sorted(available_qualities, key=lambda x: int(x[:-1]))
         
-        quality_results = {}
+        downloaded_qualities = []
         quality_files = {}
         
         for quality_idx, quality in enumerate(sorted_qualities):
-            quality_results[quality] = {
-                'downloaded': False,
-                'uploaded': False,
-                'msg_id': None,
-                'error': None
-            }
-            
-            download_path = None
-            
             try:
-                logger.info(f"Processing {quality} ({quality_idx + 1}/{len(sorted_qualities)}) for {anime_title} Ep{episode_number}")
+                logger.info(f"Downloading {anime_title} Episode {episode_number} {quality} ({quality_idx+1}/{len(sorted_qualities)})")
                 
-                quality_link = quality_mapping[quality]
-                if not quality_link:
-                    quality_results[quality]['error'] = "No link available"
-                    logger.error(f"Quality {quality} link not available")
+                stream_info = quality_mapping[quality]
+                if not stream_info:
                     continue
                 
                 if progress:
@@ -1049,229 +986,126 @@ async def process_specific_anime(anime_data: dict, progress=None) -> bool:
                         f"──────────────────\n"
                         f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
                         f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                        f"・ Qᴜᴀʟɪᴛʏ: {quality} ({quality_idx + 1}/{len(sorted_qualities)})\n"
-                        f"・ Sᴏᴜʀᴄᴇ: {quality_link['text'][:40]}...</blockquote>\n"
+                        f"・ Qᴜᴀʟɪᴛʏ: {quality} ({quality_idx+1}/{len(sorted_qualities)})\n"
+                        f"・ Aᴜᴅɪᴏ: {audio_type}\n"
+                        f"・ Sᴛᴀᴛᴜs: Exᴛʀᴀᴄᴛɪɴɢ M3U8...</blockquote>\n"
                         f"──────────────────\n"
                         f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
                         parse_mode='html'
                     )
                 
-                base_name = format_filename(anime_title, episode_number, quality, "Sub" if not is_dub else "Dub")
-                main_channel_username = CHANNEL_USERNAME if CHANNEL_USERNAME else BOT_USERNAME
-                full_caption = f"**{base_name} {main_channel_username}.mkv**"
-                filename = sanitize_filename(full_caption)
-                download_path = os.path.join(DOWNLOAD_DIR, filename)
-                
-                kwik_link = extract_kwik_link(quality_link['href'])
-                if not kwik_link:
-                    quality_results[quality]['error'] = "Failed to extract kwik link"
-                    logger.error(f"Failed to extract kwik link for {quality}")
-                    continue
-                
-                direct_link = get_dl_link(kwik_link)
-                if not direct_link:
-                    quality_results[quality]['error'] = "Failed to get direct link"
-                    logger.error(f"Failed to get direct link for {quality}")
-                    continue
-                
-                ydl_opts = {
-                    'outtmpl': download_path,
-                    'quiet': True,
-                    'no_warnings': True,
-                    'http_headers': YTDLP_HEADERS,
-                    'nocheckcertificate': True,
-                    'compat_opts': ['no-keep-video'],
-                    'retries': 5,
-                    'fragment_retries': 10,
-                }
-                
-                try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([direct_link])
-                except Exception as dl_error:
-                    quality_results[quality]['error'] = f"Download error: {str(dl_error)}"
-                    logger.error(f"Download error for {quality}: {dl_error}")
-                    continue
-                
-                if not os.path.exists(download_path):
-                    quality_results[quality]['error'] = "Downloaded file does not exist"
-                    logger.error(f"Downloaded file does not exist for {quality}")
-                    continue
-                
-                file_size = os.path.getsize(download_path)
-                if file_size < 1000:
-                    quality_results[quality]['error'] = f"Downloaded file too small ({file_size} bytes)"
-                    logger.error(f"Downloaded file too small for {quality}: {file_size} bytes")
-                    try:
-                        os.remove(download_path)
-                    except:
-                        pass
-                    continue
-                
-                quality_results[quality]['downloaded'] = True
-                episode_tracker.mark_quality_downloaded(anime_title, episode_number, quality)
-                logger.info(f"Download SUCCESS for {quality}: {format_size(file_size)}")
-                
-                if FFMPEG_AVAILABLE:
-                    final_path = os.path.join(DOWNLOAD_DIR, f"[E{episode_number:02d}] - {anime_title} [{quality}].mkv")
-                    if await rename_video_with_ffmpeg(download_path, final_path):
-                        try:
-                            os.remove(download_path)
-                        except:
-                            pass
-                        download_path = final_path
-                
-                files_to_cleanup.append(download_path)
-                
-                if progress:
-                    await progress.update(
-                        f"<b><blockquote>✦ 𝗨𝗣𝗟𝗢𝗔𝗗𝗜𝗡𝗚 ✦</blockquote>\n"
-                        f"──────────────────\n"
-                        f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                        f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                        f"・ Qᴜᴀʟɪᴛʏ: {quality} ({quality_idx + 1}/{len(sorted_qualities)})\n"
-                        f"・ Sɪᴢᴇ: {format_size(file_size)}\n"
-                        f"・ Sᴛᴀᴛᴜs: Uᴘʟᴏᴀᴅɪɴɢ...</blockquote>\n"
-                        f"──────────────────\n"
-                        f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                        parse_mode='html'
-                    )
-                
-                thumb = await get_fixed_thumbnail()
-                
-                dump_msg_id = await robust_upload_file(
-                    file_path=download_path,
-                    caption=full_caption,
-                    thumb_path=thumb,
-                    max_retries=3
+                dump_msg_id = await _download_and_upload_single_quality(
+                    anime_title, episode_number, quality, stream_info,
+                    audio_type, progress, channel_format
                 )
                 
                 if dump_msg_id:
-                    quality_results[quality]['uploaded'] = True
-                    quality_results[quality]['msg_id'] = dump_msg_id
-                    
                     if quality not in quality_files:
                         quality_files[quality] = []
                     quality_files[quality].append(dump_msg_id)
-                    
-                    episode_tracker.mark_quality_uploaded(anime_title, episode_number, quality, dump_msg_id)
                     update_processed_qualities(anime_title, episode_number, quality)
-                    
-                    logger.info(f"Upload SUCCESS for {quality}: msg_id={dump_msg_id}")
-                    
-                    try:
-                        os.remove(download_path)
-                        files_to_cleanup.remove(download_path)
-                    except:
-                        pass
+                    downloaded_qualities.append(quality)
+                    episode_tracker.mark_quality_uploaded(anime_title, episode_number, quality, dump_msg_id)
+                    logger.info(f"Successfully processed {quality}")
                 else:
-                    quality_results[quality]['error'] = "Upload failed after retries"
-                    logger.error(f"Upload FAILED for {quality} - file kept for manual retry")
+                    logger.error(f"Failed to process {quality}, will retry once")
                 
             except Exception as e:
-                quality_results[quality]['error'] = f"Exception: {str(e)}"
                 logger.error(f"Error processing quality {quality}: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+                continue
         
-        successful_qualities = [q for q, r in quality_results.items() if r['uploaded']]
-        failed_qualities = [q for q, r in quality_results.items() if not r['uploaded']]
-        
-        logger.info(f"=== QUALITY RESULTS for {anime_title} Ep{episode_number} ===")
-        logger.info(f"Successful: {successful_qualities}")
-        logger.info(f"Failed: {failed_qualities}")
-        for q, r in quality_results.items():
-            if r['error']:
-                logger.info(f"  {q}: {r['error']}")
-        
+        # Retry failed qualities once
+        failed_qualities = [q for q in sorted_qualities if q not in downloaded_qualities and quality_mapping.get(q)]
         if failed_qualities:
-            upload_failed_qualities = [q for q, r in quality_results.items() if r['downloaded'] and not r['uploaded']]
-            download_failed_qualities = [q for q, r in quality_results.items() if not r['downloaded']]
+            logger.info(f"Retrying {len(failed_qualities)} failed qualities: {failed_qualities}")
+            await asyncio.sleep(5)
             
-            logger.error(
-                f"EPISODE MARKED FAILED: {anime_title} Ep{episode_number} - "
-                f"Upload failures: {upload_failed_qualities}, Download failures: {download_failed_qualities}. "
-                f"No post created. No re-download. Scheduler will skip this episode."
-            )
-            
-            episode_tracker.release_processing(anime_title, episode_number, success=False)
-            
-            for f_path in files_to_cleanup:
+            for quality in failed_qualities:
                 try:
-                    if os.path.exists(f_path):
-                        os.remove(f_path)
-                        logger.info(f"Cleaned up failed upload file: {f_path}")
-                except Exception as cleanup_err:
-                    logger.warning(f"Could not cleanup file {f_path}: {cleanup_err}")
+                    stream_info = quality_mapping[quality]
+                    if not stream_info:
+                        continue
+                    
+                    logger.info(f"Retrying {anime_title} Episode {episode_number} {quality}")
+                    
+                    dump_msg_id = await _download_and_upload_single_quality(
+                        anime_title, episode_number, quality, stream_info,
+                        audio_type, progress, channel_format
+                    )
+                    
+                    if dump_msg_id:
+                        if quality not in quality_files:
+                            quality_files[quality] = []
+                        quality_files[quality].append(dump_msg_id)
+                        update_processed_qualities(anime_title, episode_number, quality)
+                        downloaded_qualities.append(quality)
+                        episode_tracker.mark_quality_uploaded(anime_title, episode_number, quality, dump_msg_id)
+                        logger.info(f"Retry successful for {quality}")
+                    else:
+                        logger.error(f"Retry also failed for {quality}")
+                except Exception as e:
+                    logger.error(f"Error retrying quality {quality}: {e}")
+                    continue
+        
+        if quality_files:
+            episode_tracker.mark_completed(anime_title, episode_number)
             
+            max_post_retries = 3
+            post_created = False
+            for retry in range(max_post_retries):
+                try:
+                    anilist_info = await get_anime_info(anime_title)
+                    await post_anime_with_buttons(
+                        client, anime_title, anilist_info,
+                        episode_number, audio_type, quality_files
+                    )
+                    post_created = True
+                    logger.info(f"Successfully posted banner for {anime_title} Episode {episode_number}")
+                    break
+                except FloodWaitError as e:
+                    logger.warning(f"Flood wait during post (attempt {retry+1}/{max_post_retries}): {e.seconds}s")
+                    await asyncio.sleep(e.seconds + 5)
+                except Exception as e:
+                    logger.error(f"Error posting banner (attempt {retry+1}/{max_post_retries}): {e}")
+                    if retry < max_post_retries - 1:
+                        await asyncio.sleep(5)
+            
+            # Mark as processed in DB with all downloaded qualities IMMEDIATELY
+            # This ensures even if post fails, the episode won't be reprocessed
+            mark_episode_processed(anime_title, episode_number, downloaded_qualities)
+            logger.info(f"Marked {anime_title} Ep{episode_number} as processed in DB with qualities: {downloaded_qualities}")
+            
+            if post_created:
+                episode_tracker.mark_posted(anime_title, episode_number)
+            
+            if progress:
+                await progress.update(
+                    f"<b><blockquote>✦ 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘 ✦</blockquote>\n"
+                    f"──────────────────\n"
+                    f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
+                    f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
+                    f"・ Qᴜᴀʟɪᴛɪᴇs: {', '.join(downloaded_qualities)}\n"
+                    f"・ Sᴛᴀᴛᴜs: {'Pᴏsᴛᴇᴅ ✓' if post_created else 'Uᴘʟᴏᴀᴅᴇᴅ (ᴘᴏsᴛ ғᴀɪʟᴇᴅ)'}</blockquote>\n"
+                    f"──────────────────\n"
+                    f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
+                    parse_mode='html'
+                )
+            
+            return True
+        else:
+            logger.error(f"No qualities uploaded successfully for {anime_title} Ep{episode_number}")
             if progress:
                 await progress.update(
                     f"<b><blockquote>✦ 𝗙𝗔𝗜𝗟𝗘𝗗 ✦</blockquote>\n"
                     f"──────────────────\n"
                     f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
                     f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                    f"・ Uᴘʟᴏᴀᴅ Fᴀɪʟᴇᴅ: {', '.join(upload_failed_qualities) if upload_failed_qualities else 'None'}\n"
-                    f"・ Dᴏᴡɴʟᴏᴀᴅ Fᴀɪʟᴇᴅ: {', '.join(download_failed_qualities) if download_failed_qualities else 'None'}\n"
-                    f"・ Sᴛᴀᴛᴜs: Fᴀɪʟᴇᴅ ᴀғᴛᴇʀ 3 ʀᴇᴛʀɪᴇs - sᴋɪᴘᴘᴇᴅ</blockquote>\n"
+                    f"・ Sᴛᴀᴛᴜs: Aʟʟ ǫᴜᴀʟɪᴛɪᴇs ғᴀɪʟᴇᴅ</blockquote>\n"
                     f"──────────────────\n"
                     f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
                     parse_mode='html'
                 )
-            
             return False
-        
-        if not quality_files:
-            logger.error(f"No qualities uploaded successfully for {anime_title} Ep{episode_number}")
-            return False
-        
-        logger.info(f"ALL {len(successful_qualities)} qualities uploaded successfully - creating post")
-        
-        episode_tracker.mark_completed(anime_title, episode_number)
-        
-        max_post_retries = 3
-        for retry in range(max_post_retries):
-            try:
-                anilist_info = await get_anime_info(anime_title)
-                await post_anime_with_buttons(
-                    client, 
-                    anime_title, 
-                    anilist_info,
-                    episode_number, 
-                    audio_type, 
-                    quality_files
-                )
-                post_created = True
-                logger.info(f"Successfully posted banner for {anime_title} Episode {episode_number}")
-                break
-            except FloodWaitError as e:
-                logger.warning(f"Flood wait during post (attempt {retry+1}/{max_post_retries}): {e.seconds}s")
-                await asyncio.sleep(e.seconds + 5)
-            except Exception as e:
-                logger.error(f"Error posting banner (attempt {retry+1}/{max_post_retries}): {e}")
-                if retry < max_post_retries - 1:
-                    await asyncio.sleep(5)
-        
-        if not post_created:
-            logger.error(f"CRITICAL: Failed to create post for {anime_title} Episode {episode_number} after {max_post_retries} attempts!")
-            return False
-        
-        episode_tracker.mark_posted(anime_title, episode_number)
-        
-        if progress:
-            await progress.update(
-                f"<b><blockquote>✦ 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘 ✦</blockquote>\n"
-                f"──────────────────\n"
-                f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                f"・ Qᴜᴀʟɪᴛɪᴇs: {', '.join(successful_qualities)}\n"
-                f"・ Sᴛᴀᴛᴜs: Pᴏsᴛᴇᴅ ✓</blockquote>\n"
-                f"──────────────────\n"
-                f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                parse_mode='html'
-            )
-        
-        logger.info(f"=== SUCCESS: {anime_title} Ep{episode_number} fully processed ===")
-        return True
             
     except Exception as e:
         logger.error(f"Error in process_specific_anime: {e}")
@@ -1279,8 +1113,8 @@ async def process_specific_anime(anime_data: dict, progress=None) -> bool:
         logger.error(traceback.format_exc())
         return False
     finally:
-        _currently_processing = False
-
+        if not _caller_holds_lock:
+            _currently_processing = False
 
 async def process_all_qualities(client):
     global _currently_processing
@@ -1305,47 +1139,19 @@ async def process_all_qualities(client):
             logger.info(f"Episode {episode_number} of {anime_title} already processed. Skipping.")
             return
         
+        progress = None
         if ADMIN_CHAT_ID:
-            progress = ProgressMessage(client, ADMIN_CHAT_ID, f"<b></blockquote>ᴘʀᴏᴄᴇssɪɴɢ ʟᴀᴛᴇsᴛ ᴀɪʀɪɴɢ ᴀɴɪᴍᴇ ᴡɪᴛʜ ᴀʟʟ ǫᴜᴀʟɪᴛɪᴇs...</b></blockquote>", parse_mode='html')
-            if not await progress.send():
-                logger.error("Failed to send progress message")
-                return
-            
-            await progress.update(
-                f"<b><blockquote>✦ 𝗣𝗥𝗢𝗖𝗘𝗦𝗦𝗜𝗡𝗚 ✦</blockquote>\n"
-                f"──────────────────\n"
-                f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                f"・ Eᴘɪsᴏᴅᴇ: {episode_number}\n"
-                f"・ Sᴛᴀᴛᴜs: Pʀᴏᴄᴇssɪɴɢ</blockquote>\n"
-                f"──────────────────\n"
-                f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                parse_mode='html'
-            )
+            progress = ProgressMessage(client, ADMIN_CHAT_ID, f"<b><blockquote>ᴘʀᴏᴄᴇssɪɴɢ ʟᴀᴛᴇsᴛ ᴀɪʀɪɴɢ ᴀɴɪᴍᴇ ᴡɪᴛʜ ᴀʟʟ ǫᴜᴀʟɪᴛɪᴇs...</blockquote></b>", parse_mode='html')
+            await progress.send()
         
-        success = await auto_download_latest_episode()
+        success = await process_specific_anime(latest_anime, progress)
         
         if success:
             logger.info("Successfully processed latest episode with all qualities")
-            if progress:
-                await progress.update(
-                    f"<blockquote><b>sᴜᴄᴄᴇssғᴜʟʟʏ ᴘʀᴏᴄᴇssᴇᴅ: ᴀɴɪᴍᴇ {anime_title} | ᴇᴘɪsᴏᴅᴇ {episode_number} ᴡɪᴛʜ ᴀʟʟ ǫᴜᴀʟɪᴛɪᴇs</b></blockquote>",
-                    parse_mode='html'
-                )
         else:
             logger.error("Failed to process latest episode with all qualities")
-            if progress:
-                await progress.update(
-                    f"<blockquote><b>ғᴀɪʟᴇᴅ ᴛᴏ ᴘʀᴏᴄᴇss: ᴀɴɪᴍᴇ {anime_title} | ᴇᴘɪsᴏᴅᴇ {episode_number} ᴡɪᴛʜ ᴀʟʟ ǫᴜᴀʟɪᴛɪᴇs</b></blockquote>",
-                    parse_mode='html'
-                )
     except Exception as e:
         logger.error(f"Error processing latest airing anime: {str(e)}")
-        if progress:
-            await progress.update(
-                f"<b><blockquote>ᴇʀʀᴏʀ ᴘʀᴏᴄᴇssɪɴɢ ʟᴀᴛᴇsᴛ ᴀɪʀɪɴɢ ᴀɴɪᴍᴇ:</b> {str(e)}</blockquote>",
-                parse_mode='html'
-            )
-
 
 async def process_daily_requests(client):
     global _currently_processing
@@ -1354,7 +1160,6 @@ async def process_daily_requests(client):
         get_all_pending_requests, mark_request_processed, 
         get_processed_request_results, add_processed_request_result
     )
-    from core.download import post_anime_batch_with_buttons
     
     logger.info("Processing daily requests...")
     channel_format = (CHANNEL_USERNAME or BOT_USERNAME).lstrip('@')
@@ -1379,16 +1184,13 @@ async def process_daily_requests(client):
                 
                 logger.info(f"Processing request {idx}/{len(pending_requests)}: {request_text}")
                 
+                progress = None
                 if ADMIN_CHAT_ID:
                     progress = ProgressMessage(client, ADMIN_CHAT_ID, 
-                        f"<b><blockquote>ᴘʀᴏᴄᴇssɪɴɢ ʀᴇǫᴜᴇsᴛ ({idx}/{len(pending_requests)})...</b></blockquote>",
+                        f"<b><blockquote>ᴘʀᴏᴄᴇssɪɴɢ ʀᴇǫᴜᴇsᴛ ({idx}/{len(pending_requests)})...</blockquote></b>",
                         parse_mode='html'
                     )
-                    if not await progress.send():
-                        logger.error("Failed to send progress message")
-                        continue
-                else:
-                    progress = None
+                    await progress.send()
                 
                 search_results = await search_anime(request_text)
                 
@@ -1396,14 +1198,13 @@ async def process_daily_requests(client):
                     logger.warning(f"No results found for request: {request_text}")
                     if progress:
                         await progress.update(
-                            f"<b><blockquote>ɴᴏ ʀᴇsᴜʟᴛs ғᴏᴜɴᴅ ғᴏʀ: {request_text}</b></blockquote>",
+                            f"<b><blockquote>ɴᴏ ʀᴇsᴜʟᴛs ғᴏᴜɴᴅ ғᴏʀ: {request_text}</blockquote></b>",
                             parse_mode='html'
                         )
                     mark_request_processed(request_id)
                     continue
                 
                 processed_results = await get_processed_request_results(request_text)
-                logger.info(f"Previously processed results for '{request_text}': {processed_results}")
                 
                 remaining_results = []
                 for result in search_results:
@@ -1413,33 +1214,14 @@ async def process_daily_requests(client):
                 
                 if not remaining_results:
                     logger.info(f"All search results for '{request_text}' have been processed")
-                    if progress:
-                        await progress.update(
-                            f"<b><blockquote>ᴀʟʟ ʀᴇsᴜʟᴛs ғᴏʀ '{request_text}' ʜᴀᴠᴇ ʙᴇᴇɴ ᴘʀᴏᴄᴇssᴇᴅ</b></blockquote>",
-                            parse_mode='html'
-                        )
                     mark_request_processed(request_id)
                     continue
-                
-                if progress:
-                    await progress.update(
-                        f"<b><blockquote>ғᴏᴜɴᴅ {len(remaining_results)} ɴᴇᴡ ʀᴇsᴜʟᴛs ғᴏʀ: {request_text}\n"
-                        f"ᴘʀᴏᴄᴇssɪɴɢ...</b></blockquote>",
-                        parse_mode='html'
-                    )
                 
                 processed_any = False
                 for result_idx, anime_result in enumerate(remaining_results[:1], 1):
                     try:
                         anime_title = anime_result.get('title', anime_result.get('anime_title'))
                         anime_session = anime_result.get('session')
-                        
-                        if progress:
-                            await progress.update(
-                                f"<b><blockquote>ᴘʀᴏᴄᴇssɪɴɢ:</b>\n"
-                                f"{anime_title}</blockquote>",
-                                parse_mode='html'
-                            )
                         
                         logger.info(f"Processing result: {anime_title}")
                         
@@ -1451,71 +1233,50 @@ async def process_daily_requests(client):
                         total_episodes = len(episodes)
                         logger.info(f"Found {total_episodes} episodes for {anime_title}")
                         
-                        anime_info = await get_anime_info(anime_title)
+                        anime_info_anilist = await get_anime_info(anime_title)
                         
                         enabled_qualities = quality_settings.enabled_qualities
                         sorted_qualities = sorted(enabled_qualities, key=lambda x: int(x[:-1]))
                         
                         all_quality_files = {q: [] for q in sorted_qualities}
                         
-                        first_ep_links = get_download_links(anime_session, episodes[0].get('session'))
-                        is_dub = any('eng' in link['text'].lower() for link in first_ep_links) if first_ep_links else False
-                        audio_type = "Dub" if is_dub else "Sub"
+                        first_ep_streams = get_stream_links(anime_session, episodes[0].get('session'))
+                        audio_type = detect_audio_type(first_ep_streams) if first_ep_streams else "Sub"
                         
                         thumb = await get_fixed_thumbnail()
                         
-                        for quality_idx, quality in enumerate(sorted_qualities):
-                            quality_progress = quality_idx + 1
+                        for ep_idx, episode in enumerate(episodes):
+                            episode_number = int(episode.get('episode', 0))
+                            episode_session = episode.get('session')
                             
-                            if progress:
-                                await progress.update(
-                                    f"<b><blockquote>✦ 𝗥𝗘𝗤𝗨𝗘𝗦𝗧 𝗣𝗥𝗢𝗖𝗘𝗦𝗦𝗜𝗡𝗚 ✦</blockquote>\n"
-                                    f"──────────────────\n"
-                                    f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                                    f"・ Qᴜᴀʟɪᴛʏ: {quality} ({quality_progress}/{len(sorted_qualities)})\n"
-                                    f"・ Eᴘɪsᴏᴅᴇs: {total_episodes}\n"
-                                    f"・ Sᴛᴀᴛᴜs: Sᴛᴀʀᴛɪɴɢ {quality} ʙᴀᴛᴄʜ...</blockquote>\n"
-                                    f"──────────────────\n"
-                                    f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                                    parse_mode='html'
-                                )
-                            
-                            for ep_idx, episode in enumerate(episodes):
-                                episode_number = int(episode.get('episode', 0))
-                                episode_session = episode.get('session')
+                            try:
+                                if progress:
+                                    await progress.update(
+                                        f"<b><blockquote>✦ 𝗥𝗘𝗤𝗨𝗘𝗦𝗧 𝗣𝗥𝗢𝗖𝗘𝗦𝗦𝗜𝗡𝗚 ✦</blockquote>\n"
+                                        f"──────────────────\n"
+                                        f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
+                                        f"・ Eᴘɪsᴏᴅᴇ: {episode_number} ({ep_idx+1}/{total_episodes})\n"
+                                        f"・ Sᴛᴀᴛᴜs: Fᴇᴛᴄʜɪɴɢ sᴛʀᴇᴀᴍs...</blockquote>\n"
+                                        f"──────────────────\n"
+                                        f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
+                                        parse_mode='html'
+                                    )
                                 
-                                try:
-                                    if progress:
-                                        await progress.update(
-                                            f"<b><blockquote>✦ 𝗥𝗘𝗤𝗨𝗘𝗦𝗧 𝗣𝗥𝗢𝗖𝗘𝗦𝗦𝗜𝗡𝗚 ✦</blockquote>\n"
-                                            f"──────────────────\n"
-                                            f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                                            f"・ Qᴜᴀʟɪᴛʏ: {quality} ({quality_progress}/{len(sorted_qualities)})\n"
-                                            f"・ Eᴘɪsᴏᴅᴇ: {episode_number} ({ep_idx+1}/{total_episodes})\n"
-                                            f"・ Sᴛᴀᴛᴜs: Dᴏᴡɴʟᴏᴀᴅɪɴɢ...</blockquote>\n"
-                                            f"──────────────────\n"
-                                            f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                                            parse_mode='html'
-                                        )
-                                    
-                                    download_links = get_download_links(anime_session, episode_session)
-                                    if not download_links:
-                                        logger.warning(f"No download links for {anime_title} Episode {episode_number}")
+                                ep_stream_links = await asyncio.to_thread(get_stream_links, anime_session, episode_session)
+                                if not ep_stream_links:
+                                    logger.warning(f"No streams for Episode {episode_number}, skipping")
+                                    continue
+                                
+                                ep_quality_mapping = get_quality_streams(ep_stream_links, sorted_qualities, "jpn")
+                                
+                                for quality in sorted_qualities:
+                                    stream_info = ep_quality_mapping.get(quality)
+                                    if not stream_info:
                                         continue
                                     
-                                    quality_mapping = get_available_qualities_with_mapping(download_links, [quality])
-                                    quality_link = quality_mapping.get(quality)
-                                    
-                                    if not quality_link:
-                                        logger.warning(f"Quality {quality} not available for Episode {episode_number}")
-                                        continue
-                                    
-                                    kwik_link = extract_kwik_link(quality_link['href'])
-                                    if not kwik_link:
-                                        continue
-                                    
-                                    direct_link = get_dl_link(kwik_link)
-                                    if not direct_link:
+                                    kwik_url = stream_info['url']
+                                    m3u8_data = await asyncio.to_thread(extract_m3u8_from_kwik, kwik_url)
+                                    if not m3u8_data:
                                         continue
                                     
                                     base_name = format_filename(anime_title, episode_number, quality, audio_type)
@@ -1524,92 +1285,43 @@ async def process_daily_requests(client):
                                     filename = sanitize_filename(f"{base_name}.mkv")
                                     download_path = os.path.join(DOWNLOAD_DIR, filename)
                                     
-                                    if progress:
-                                        await progress.update(
-                                            f"<b><blockquote>✦ 𝗥𝗘𝗤𝗨𝗘𝗦𝗧 𝗣𝗥𝗢𝗖𝗘𝗦𝗦𝗜𝗡𝗚 ✦</blockquote>\n"
-                                            f"──────────────────\n"
-                                            f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                                            f"・ Qᴜᴀʟɪᴛʏ: {quality} ({quality_progress}/{len(sorted_qualities)})\n"
-                                            f"・ Eᴘɪsᴏᴅᴇ: {episode_number} ({ep_idx+1}/{total_episodes})\n"
-                                            f"・ Sᴛᴀᴛᴜs: Dᴏᴡɴʟᴏᴀᴅɪɴɢ {quality}...</blockquote>\n"
-                                            f"──────────────────\n"
-                                            f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                                            parse_mode='html'
+                                    dl_success = await download_m3u8(m3u8_data['m3u8_url'], m3u8_data['headers'], download_path)
+                                    
+                                    if dl_success and os.path.exists(download_path) and os.path.getsize(download_path) > 1000:
+                                        dump_msg_id = await robust_upload_file(
+                                            file_path=download_path,
+                                            caption=full_caption,
+                                            thumb_path=thumb,
+                                            max_retries=3
                                         )
-                                    
-                                    ydl_opts = {
-                                        'outtmpl': download_path,
-                                        'quiet': True,
-                                        'no_warnings': True,
-                                        'http_headers': YTDLP_HEADERS,
-                                        'nocheckcertificate': True,
-                                    }
-                                    
-                                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                                        ydl.download([direct_link])
-                                    
-                                    if not os.path.exists(download_path) or os.path.getsize(download_path) < 1000:
-                                        logger.error(f"Downloaded file is too small: {download_path}")
-                                        continue
-                                    
-                                    if progress:
-                                        await progress.update(
-                                            f"<b><blockquote>✦ 𝗥𝗘𝗤𝗨𝗘𝗦𝗧 𝗣𝗥𝗢𝗖𝗘𝗦𝗦𝗜𝗡𝗚 ✦</blockquote>\n"
-                                            f"──────────────────\n"
-                                            f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                                            f"・ Qᴜᴀʟɪᴛʏ: {quality} ({quality_progress}/{len(sorted_qualities)})\n"
-                                            f"・ Eᴘɪsᴏᴅᴇ: {episode_number} ({ep_idx+1}/{total_episodes})\n"
-                                            f"・ Sᴛᴀᴛᴜs: Uᴘʟᴏᴀᴅɪɴɢ {quality}...</blockquote>\n"
-                                            f"──────────────────\n"
-                                            f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                                            parse_mode='html'
-                                        )
-                                    
-                                    dump_msg_id = await robust_upload_file(
-                                        file_path=download_path,
-                                        caption=full_caption,
-                                        thumb_path=thumb,
-                                        max_retries=3
-                                    )
-                                    
-                                    if dump_msg_id:
-                                        all_quality_files[quality].append(dump_msg_id)
-                                        logger.info(f"Uploaded Episode {episode_number} [{quality}] - msg_id: {dump_msg_id}")
+                                        
+                                        if dump_msg_id:
+                                            all_quality_files[quality].append(dump_msg_id)
+                                            logger.info(f"Uploaded Episode {episode_number} [{quality}] - msg_id: {dump_msg_id}")
+                                        
+                                        try:
+                                            os.remove(download_path)
+                                        except:
+                                            pass
                                     else:
-                                        logger.error(f"Upload FAILED after 3 retries: Episode {episode_number} [{quality}] - skipping")
-                                    
-                                    try:
-                                        os.remove(download_path)
-                                    except:
-                                        pass
+                                        try:
+                                            if os.path.exists(download_path):
+                                                os.remove(download_path)
+                                        except:
+                                            pass
                                 
-                                except Exception as e:
-                                    logger.error(f"Error processing Episode {episode_number} [{quality}]: {e}")
-                                    import traceback
-                                    logger.error(traceback.format_exc())
+                            except Exception as e:
+                                logger.error(f"Error processing Episode {episode_number}: {e}")
                             
-                            logger.info(f"Completed all episodes for quality {quality}: {len(all_quality_files[quality])} uploaded")
+                            await asyncio.sleep(2)
                         
                         final_quality_files = {q: ids for q, ids in all_quality_files.items() if ids}
                         
-                        if final_quality_files and anime_info:
+                        if final_quality_files:
                             logger.info(f"Creating final channel post for {anime_title}")
-                            logger.info(f"Quality files: {final_quality_files}")
-                            
-                            if progress:
-                                await progress.update(
-                                    f"<b><blockquote>✦ 𝗙𝗜𝗡𝗔𝗟𝗜𝗭𝗜𝗡𝗚 ✦</blockquote>\n"
-                                    f"──────────────────\n"
-                                    f"<blockquote>・ Aɴɪᴍᴇ: {anime_title}\n"
-                                    f"・ Eᴘɪsᴏᴅᴇs: {total_episodes}\n"
-                                    f"・ Sᴛᴀᴛᴜs: Cʀᴇᴀᴛɪɴɢ ғɪɴᴀʟ ᴘᴏsᴛ...</blockquote>\n"
-                                    f"──────────────────\n"
-                                    f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                                    parse_mode='html'
-                                )
                             
                             await post_anime_batch_with_buttons(
-                                client, anime_title, anime_info, final_quality_files, total_episodes, audio_type
+                                client, anime_title, anime_info_anilist, final_quality_files, total_episodes, audio_type
                             )
                             
                             await add_processed_request_result(request_text, anime_title)
@@ -1626,24 +1338,6 @@ async def process_daily_requests(client):
                 if processed_any:
                     mark_request_processed(request_id)
                     
-                    if progress:
-                        await progress.update(
-                            f"<b><blockquote>✦ ᴄᴏᴍᴘʟᴇᴛᴇᴅ ✦</blockquote>\n"
-                            f"──────────────────\n"
-                            f"<blockquote>・ Rᴇǫᴜᴇsᴛ: {request_text}\n"
-                            f"・ Sᴛᴀᴛᴜs: ᴄᴏᴍᴘʟᴇᴛᴇᴅ</blockquote>\n"
-                            f"──────────────────\n"
-                            f"<blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/{channel_format}'>{CHANNEL_NAME}</a></blockquote></b>",
-                            parse_mode='html'
-                        )
-                else:
-                    logger.warning(f"Failed to process any results for request '{request_text}'")
-                    if progress:
-                        await progress.update(
-                            f"<b><blockquote>ғᴀɪʟᴇᴅ ᴛᴏ ᴘʀᴏᴄᴇss ʀᴇǫᴜᴇsᴛ: {request_text}</b></blockquote>",
-                            parse_mode='html'
-                        )
-                
             except Exception as e:
                 logger.error(f"Error processing request {idx}: {e}")
                 import traceback
@@ -1659,33 +1353,26 @@ async def process_daily_requests(client):
         _currently_processing = False
         logger.info("Request processing finished - auto-processing RESUMED")
 
-
-# IST Timezone (UTC+5:30)
 IST = ZoneInfo("Asia/Kolkata")
 UTC = ZoneInfo("UTC")
 
-
 def convert_ist_to_utc(ist_time_str: str) -> str:
     try:
-        hour, minute = map(int, ist_time_str.split(':'))
-        
-        today = datetime.now(IST).date()
-        ist_datetime = datetime(today.year, today.month, today.day, hour, minute, tzinfo=IST)
-        
+        ist_time = datetime.strptime(ist_time_str, "%H:%M")
+        ist_datetime = datetime.now(IST).replace(
+            hour=ist_time.hour, minute=ist_time.minute, second=0, microsecond=0
+        )
         utc_datetime = ist_datetime.astimezone(UTC)
-        
-        return utc_datetime.strftime('%H:%M')
+        return utc_datetime.strftime("%H:%M")
     except Exception as e:
         logger.error(f"Error converting IST to UTC: {e}")
-        return ist_time_str
-
+        return "00:00"
 
 def get_current_ist_time() -> str:
-    return datetime.now(IST).strftime('%H:%M')
+    return datetime.now(IST).strftime("%H:%M:%S")
 
-
-_request_time_job_tag = "daily_request_processing"
-
+def get_current_utc_time() -> str:
+    return datetime.now(UTC).strftime("%H:%M:%S")
 
 def setup_scheduler(client):
     def schedule_check():
@@ -1708,10 +1395,9 @@ def setup_scheduler(client):
                 utc_time_str = convert_ist_to_utc(ist_time_str)
                 
                 schedule.clear(_request_time_job_tag)
-                
                 schedule.every().day.at(utc_time_str).do(schedule_daily_requests).tag(_request_time_job_tag)
                 
-                logger.info(f"𝗗𝗮𝗶𝗹𝘆 𝗿𝗲𝗾𝘂𝗲𝘀𝘁 𝗽𝗿𝗼𝗰𝗲𝘀𝘀𝗶𝗻𝗴 𝘀𝗰𝗵𝗲𝗱𝘂𝗹𝗲𝗱 𝗮𝘁 {ist_time_str} IST ({utc_time_str} UTC)")
+                logger.info(f"Daily request processing scheduled at {ist_time_str} IST ({utc_time_str} UTC)")
             else:
                 logger.info("No daily request processing time configured")
         except Exception as e:
@@ -1724,7 +1410,7 @@ def setup_scheduler(client):
         
         interval = auto_download_state.interval
         schedule.every(interval).seconds.do(schedule_check)
-        logger.info(f"𝙎𝙩𝙖𝙧𝙩𝙞𝙣𝙜 𝙎𝙘𝙝𝙚𝙙𝙪𝙡𝙚𝙧")
+        logger.info(f"Scheduler started with interval: {interval}s")
     
     reschedule()
     
@@ -1744,7 +1430,6 @@ def setup_scheduler(client):
     
     asyncio.create_task(scheduler_loop())
 
-
 async def reschedule_daily_requests(ist_time_str: str):
     try:
         utc_time_str = convert_ist_to_utc(ist_time_str)
@@ -1758,8 +1443,9 @@ async def reschedule_daily_requests(ist_time_str: str):
         
         schedule.every().day.at(utc_time_str).do(schedule_daily_requests_job).tag(_request_time_job_tag)
         
-        logger.info(f"𝗥𝗲𝘀𝗰𝗵𝗲𝗱𝘂𝗹𝗲𝗱 𝗱𝗮𝗶𝗹𝘆 𝗿𝗲𝗾𝘂𝗲𝘀𝘁 𝗽𝗿𝗼𝗰𝗲𝘀𝘀𝗶𝗻𝗴 𝘁𝗼 {ist_time_str} IST ({utc_time_str} UTC)")
+        logger.info(f"Rescheduled daily request processing to {ist_time_str} IST ({utc_time_str} UTC)")
         return True
     except Exception as e:
         logger.error(f"Error rescheduling daily requests: {e}")
         return False
+

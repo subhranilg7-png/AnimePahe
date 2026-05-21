@@ -34,7 +34,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 class Config:
     ABC=1
 
@@ -57,7 +56,6 @@ def get_env_var(key: str, default: Any = None, required: bool = True) -> Any:
     logger.debug(f"Loaded environment variable: {key}")
     return value
 
-
 logger.info("Loading essential configuration...")
 try:
     API_ID = int(get_env_var("API_ID"))
@@ -65,7 +63,7 @@ try:
     BOT_TOKEN = get_env_var("BOT_TOKEN")
     ADMIN_CHAT_ID = int(get_env_var("ADMIN_CHAT_ID"))
     MONGO_URI = get_env_var("MONGO_URI", required=False)
-    PORT = int(get_env_var("PORT", "8090"))
+    PORT = int(get_env_var("PORT", "7860"))
     BOT_USERNAME = get_env_var("BOT_USERNAME", "BlakiteX9AnimeBot")
     logger.info("Successfully loaded all environment variables")
 except ValueError as e:
@@ -129,12 +127,6 @@ START_PIC_URL = get_env_var(
     required=False
 )
 
-STICKER_ID = get_env_var(
-    "STICKER_ID",
-    "CAACAgUAAxkBAAEQJ6hpV0JDpDDOI68yH7lV879XbIWiFwACGAADQ3PJEs4sW1y9vZX3OAQ",
-    required=False
-)
-
 DELETE_TIMER = int(get_env_var("DELETE_TIMER", 1800, required=False))
 AUTO_DOWNLOAD_STATE_FILE = BASE_DIR / "auto_download_state.json"
 QUALITY_SETTINGS_FILE = BASE_DIR / "quality_settings.json"
@@ -143,7 +135,7 @@ JSON_DATA_FILE = BASE_DIR / "anime_data.json"
 FFMPEG_PATH = "ffmpeg"
 
 HEADERS = {
-    'authority': 'animepahe.si',
+    'authority': 'animepahe.pw',
     'accept': 'application/json, text/javascript, */*; q=0.01',
     'accept-language': 'en-US,en;q=0.9',
     'cookie': '__ddg2_=;',
@@ -155,41 +147,18 @@ HEADERS = {
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
     'x-requested-with': 'XMLHttpRequest',
-    'referer': 'https://animepahe.si/',
+    'referer': 'https://animepahe.pw/',
     'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
 }
 
-YTDLP_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Referer': 'https://kwik.cx/',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'same-origin',
-    'Sec-Fetch-User': '?1',
-    'Cache-Control': 'max-age=0'
-}
-
-WORKER_BASE_URL = get_env_var(
-    "WORKER_BASE_URL",
-    "https://pahe-babu.raviguj4554.workers.dev/?d=",
-    required=False
-)
-
-PAHE_LINKS_WORKER_URL = get_env_var(
-    "PAHE_LINKS_WORKER_URL",
-    "https://pahelinks.raviguj4554.workers.dev/",
-    required=False
-)
+ANILIST_API = "https://graphql.anilist.co"
 
 ANILIST_API = "https://graphql.anilist.co"
 
 SEARCH, SELECT_ANIME, SELECT_EPISODE, SELECT_QUALITY, DOWNLOADING = range(5)
 AUTO_DISABLED, AUTO_ENABLED = range(2)
+
+WEB_PORT = PORT
 
 HELP_TEXT='''<b>
 <blockquote>✦ 𝗛𝗘𝗟𝗣𝗘𝗥 ✦</blockquote>
@@ -206,10 +175,11 @@ HELP_TEXT='''<b>
 <code>/set_max_requests [number]</code> - sᴇᴛ ᴍᴀxɪᴍᴜᴍ ɴᴜᴍʙᴇʀ ᴏғ ᴄᴏɴᴄᴜʀʀᴇɴᴛ ʀᴇǫᴜᴇsᴛs
 <code>/view_requests</code> - sʜᴏᴡ ᴘᴇɴᴅɪɴɢ ʀᴇǫᴜᴇsᴛs
 <code>/set_request_group [group_id]</code> - sᴇᴛ ᴛʜᴇ ʀᴇǫᴜᴇsᴛ ɢʀᴏᴜᴘ
-<code>/request [anime name]</code> or <code>#request [anime name]</code> - ʀᴇǫᴜᴇsᴛ ᴀɴ ᴀɴɪᴍᴇ ᴛᴏ ʙᴇ ᴅᴏᴡɴʟᴏᴀᴅᴇᴅ
+<code>/request [anime name]</code> or <code>
 <code>/addtask [number]</code> - ᴅᴏᴡɴʟᴏᴀᴅ sᴘᴇᴄɪғɪᴄ ᴀɴɪᴍᴇ ғʀᴏᴍ ʟᴀᴛᴇsᴛ ᴀɪʀɪɴɢ ʟɪsᴛ
 <code>/redownload [number]</code> - ғᴏʀᴄᴇ ʀᴇᴅᴏᴡɴʟᴏᴀᴅ ᴀ sᴘᴇᴄɪғɪᴄ ᴀɴɪᴍᴇ
 <code>/add_admin [user_id]</code> - ᴀᴅᴅ ᴀ ɴᴇᴡ ᴀᴅᴍɪɴ
 <code>/remove_admin [user_id]</code> - ʀᴇᴍᴏᴠᴇ ᴀɴ ᴀᴅᴍɪɴ</blockquote expandable>
 ──────────────────
 <blockquote>≡ ᴘᴏᴡᴇʀᴇᴅ ʙʏ: <a href='t.me/GenAnimeOngoing'>𝗢𝗻𝗴𝗼𝗶𝗻𝗴 𝗔𝗻𝗶𝗺𝗲 - 𝗪𝗶𝗻𝘁𝗲𝗿 𝟮𝟬𝟮𝟲</a></blockquote></b>'''
+

@@ -1,35 +1,37 @@
 FROM python:3.11-slim
 
 # Install system dependencies
-USER root
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
     aria2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Set the working directory
+# Set working directory
 WORKDIR /app
 
-# Copy only requirements first to leverage Docker layer caching
+# Copy requirements first for caching
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the full application code
+# Copy application code
 COPY . .
 
-# Create a non-root user and switch to it for security
-RUN useradd -m appuser && chown -R appuser:appuser /app
+# Create non-root user
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app && \
+    mkdir -p /app/logs /app/anime_downloads /app/thumbnails && \
+    chown -R appuser:appuser /app/logs /app/anime_downloads /app/thumbnails
+
 USER appuser
 
-# Expose the port your FastAPI app will run on
-EXPOSE 8080
+# HF Spaces requires port 7860
+ENV PORT=7860
+EXPOSE 7860
 
-# Health check (FastAPI endpoint at /health)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+# Health check for HF Spaces
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:7860/health || exit 1
 
-# Run the bot — your bot.py manually starts uvicorn and Telethon
+# Run the bot
 CMD ["python", "bot.py"]

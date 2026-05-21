@@ -50,7 +50,6 @@ try:
 except (subprocess.CalledProcessError, FileNotFoundError):
     logger.warning("FFmpeg is not available. Some features may not work.")
 
-
 def install_ffmpeg():
     try:
         subprocess.run([FFMPEG_PATH, "-version"], check=True, capture_output=True)
@@ -73,12 +72,10 @@ def install_ffmpeg():
                 logger.error(f"Failed to install FFmpeg with yum: {e}")
                 return False
 
-
 if not FFMPEG_AVAILABLE and not install_ffmpeg():
     logger.error("FFmpeg is not available. Video conversion will be skipped.")
 else:
     FFMPEG_AVAILABLE = True
-
 
 def install_ytdlp():
     try:
@@ -92,3 +89,4 @@ try:
 except ImportError:
     if install_ytdlp():
         import yt_dlp
+
