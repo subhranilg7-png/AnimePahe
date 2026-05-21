@@ -112,7 +112,7 @@ PORT=8080
 - `cd AnimePahe`
 - ɪɴsᴛᴀʟʟ ᴘᴀᴄᴋᴀɢᴇs ᴜsɪɴɢ `pip install -r requirements.txt`
 - ᴄʀᴇᴀᴛᴇ ᴀ `.env` ꜰɪʟᴇ ᴀɴᴅ ꜰɪʟʟ ɪᴛ ᴡɪᴛʜ ᴛʜᴇ ᴠᴀʀɪᴀʙʟᴇs ᴘʀᴏᴠɪᴅᴇᴅ ᴀʙᴏᴠᴇ
-- ʀᴜɴ ᴛʜᴇ ʙᴏᴛ ᴜsɪɴɢ `python main.py`
+- ʀᴜɴ ᴛʜᴇ ʙᴏᴛ ᴜsɪɴɢ `python bot.py`
 
 </details>
 
